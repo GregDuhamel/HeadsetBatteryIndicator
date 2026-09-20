@@ -1,9 +1,7 @@
-//! The daemon itself: poll HeadsetControl, mirror what it says onto virtual
-//! HID batteries, and keep answering the kernel while it waits.
+//! The daemon itself: read the batteries, mirror them onto virtual HID
+//! batteries, and keep answering the kernel in between.
 
-use std::cell::Cell;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -11,20 +9,25 @@ use anyhow::{Context, Result};
 use log::{debug, error, info, trace, warn};
 use rustix::event::{PollFd, PollFlags};
 
-use crate::headsetcontrol::{BatteryState, Headset};
+use crate::headset::{BatteryState, Headset};
 use crate::source::Source;
-use crate::uhid::{self, CreateParams, Event, Uhid};
+use uhid_battery::{Battery, DEV_UHID, Handle, Identity, Kind};
 
-/// How long a single `poll()` may block, so a signal is noticed promptly even
-/// if it arrives while we are idle.
-const MAX_POLL_SLICE: Duration = Duration::from_millis(500);
+/// Default delay between two readings, in seconds.
+pub const DEFAULT_INTERVAL_SECS: u64 = 60;
+/// Default for [`Config::offline_grace`], in seconds.
+pub const DEFAULT_OFFLINE_GRACE_SECS: u64 = 900;
+/// Default for [`Config::missing_grace`], in seconds.
+pub const DEFAULT_MISSING_GRACE_SECS: u64 = 180;
 
-/// uhid registers the device from a worker, and hid-core drops input reports
-/// until the driver has finished probing. `UHID_START` arrives mid-probe, so
-/// the level is pushed again this long after it. Should that still be too
-/// early nothing breaks: the kernel queries us (`GET_REPORT`) until a push
-/// lands. (Learned the hard way in razerd, which bridges a mouse the same way.)
-const START_SETTLE_DELAY: Duration = Duration::from_millis(250);
+/// The longest a single `poll()` may block. A signal interrupts `poll()`, so
+/// this only bounds the shutdown delay in the unlucky case where the signal
+/// lands between checking the stop flag and entering the call.
+const MAX_WAIT: Duration = Duration::from_secs(5);
+
+/// First component of the virtual devices' `phys`, which the udev rule that
+/// makes UPower report a headset matches on.
+pub const PHYS_PREFIX: &str = "headset-battery-indicator";
 
 /// How long the kernel gets to register the power supply after a device is
 /// created. It happens synchronously in practice; this is slack.
@@ -156,10 +159,10 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            interval: Duration::from_secs(60),
-            offline_grace: Duration::from_secs(900),
-            missing_grace: Duration::from_secs(180),
-            uhid_path: PathBuf::from(uhid::DEV_UHID),
+            interval: Duration::from_secs(DEFAULT_INTERVAL_SECS),
+            offline_grace: Duration::from_secs(DEFAULT_OFFLINE_GRACE_SECS),
+            missing_grace: Duration::from_secs(DEFAULT_MISSING_GRACE_SECS),
+            uhid_path: PathBuf::from(DEV_UHID),
         }
     }
 }
@@ -169,88 +172,38 @@ impl Default for Config {
 struct VirtualBattery {
     key: String,
     name: String,
-    uhid: Uhid,
-    percent: u8,
-    charging: bool,
+    device: Battery,
     /// When the headset last gave us a usable level.
     last_reading: Instant,
-    /// When the headset was last reported by HeadsetControl at all, answering
-    /// or not.
+    /// When the headset was last reported at all, answering or not.
     last_seen: Instant,
     /// A reading that was too far off to publish, waiting for confirmation.
     deferred: Option<u8>,
     /// The level the last INFO line mentioned.
     logged_percent: u8,
-    /// When the current level has to be pushed again, because the kernel may
-    /// have dropped the previous push while it was still probing the device.
-    repush_at: Cell<Option<Instant>>,
 }
 
 impl VirtualBattery {
-    fn report(&self) -> [u8; uhid::REPORT_LEN] {
-        uhid::battery_report(self.percent, self.charging)
+    /// Pushes a reading to the kernel.
+    fn publish(&mut self, percent: u8, charging: bool) -> Result<()> {
+        self.device
+            .update(percent, charging)
+            .with_context(|| format!("publishing the level of {}", self.name))
     }
 
-    /// Pushes the current state to the kernel.
-    fn publish(&self) -> Result<()> {
-        self.uhid
-            .send_input(&self.report())
-            .with_context(|| format!("sending a battery report for {}", self.name))
-    }
-
-    /// Pushes the level again once the settle delay has elapsed.
-    fn repush_if_due(&self) -> Result<()> {
-        match self.repush_at.get() {
-            Some(due) if Instant::now() >= due => {
-                self.repush_at.set(None);
-                trace!(
-                    "{}: pushing the level again now that the probe is over",
-                    self.name
-                );
-                self.publish()
-            }
-            _ => Ok(()),
-        }
-    }
-
-    /// Drains the kernel's event queue, answering the requests that would
-    /// otherwise block `hid-input` for five seconds each.
-    fn service(&self) -> Result<()> {
-        while let Some(event) = self
-            .uhid
-            .read_event()
-            .with_context(|| format!("reading uhid events for {}", self.name))?
-        {
-            match event {
-                Event::GetReport { id, rnum } => {
-                    trace!("{}: answering a get_report for report {rnum}", self.name);
-                    self.uhid.reply_get_report(id, &self.report())?;
-                }
-                Event::SetReport { id } => {
-                    trace!("{}: acknowledging a set_report", self.name);
-                    self.uhid.reply_set_report(id)?;
-                }
-                Event::Start => {
-                    debug!("{}: the kernel attached the virtual device", self.name);
-                    self.repush_at
-                        .set(Some(Instant::now() + START_SETTLE_DELAY));
-                }
-                Event::Open => trace!("{}: the device node was opened", self.name),
-                Event::Stop | Event::Close => {
-                    debug!("{}: the kernel detached the virtual device", self.name);
-                }
-                Event::Output => {}
-                Event::Other(kind) => trace!("{}: ignoring uhid event {kind}", self.name),
-            }
-        }
-        Ok(())
+    /// Answers the kernel, which would otherwise keep whoever is reading the
+    /// level from sysfs waiting for five seconds.
+    fn service(&mut self) -> Result<()> {
+        self.device
+            .service()
+            .with_context(|| format!("servicing the virtual device of {}", self.name))
     }
 }
 
 /// Hands out uhid handles, reusing the ones the service manager passed.
 #[derive(Debug)]
 struct DevicePool {
-    spare: Vec<Uhid>,
+    spare: Vec<Handle>,
     path: PathBuf,
     /// Whether opening the device node ourselves is allowed. It is not when
     /// systemd handed us descriptors: the node stays `root:root 0600` and the
@@ -259,7 +212,7 @@ struct DevicePool {
 }
 
 impl DevicePool {
-    fn new(inherited: Vec<Uhid>, path: PathBuf) -> Self {
+    fn new(inherited: Vec<Handle>, path: PathBuf) -> Self {
         let may_open = inherited.is_empty();
         Self {
             spare: inherited,
@@ -268,7 +221,7 @@ impl DevicePool {
         }
     }
 
-    fn acquire(&mut self) -> Result<Uhid> {
+    fn acquire(&mut self) -> Result<Handle> {
         if let Some(handle) = self.spare.pop() {
             return Ok(handle);
         }
@@ -277,27 +230,17 @@ impl DevicePool {
             "out of inherited /dev/uhid descriptors; pass another one with a second \
              OpenFile=/dev/uhid:uhid2 line in the unit file"
         );
-        Uhid::open(&self.path).with_context(|| format!("opening {}", self.path.display()))
+        Handle::open(&self.path).with_context(|| format!("opening {}", self.path.display()))
     }
 
-    /// Destroys the device backed by `handle` and keeps the handle for reuse.
-    fn release(&mut self, handle: Uhid) {
-        if let Err(err) = handle.destroy() {
-            warn!("could not destroy a virtual device: {err}");
-        }
-        // Drain what the kernel queued for the device we just destroyed;
-        // otherwise a stale event surfaces against the next device created on
-        // this handle, and the log reads as if it had been detached on arrival.
-        while let Ok(Some(event)) = handle.read_event() {
-            trace!("draining {event:?} from a released handle");
-        }
-        self.put_back(handle);
+    /// Withdraws a battery and keeps its handle: one passed by the service
+    /// manager cannot be reopened, so losing it would leave the daemon unable
+    /// to publish anything until it is restarted.
+    fn release(&mut self, battery: Battery) {
+        self.put_back(battery.destroy());
     }
 
-    /// Returns a handle that never carried a device. Descriptors passed by the
-    /// service manager cannot be reopened, so losing one would leave the daemon
-    /// unable to publish anything until it is restarted.
-    fn put_back(&mut self, handle: Uhid) {
+    fn put_back(&mut self, handle: Handle) {
         self.spare.push(handle);
     }
 }
@@ -316,7 +259,7 @@ pub struct Bridge {
 impl Bridge {
     /// Builds a bridge from its configuration and any inherited uhid handle.
     #[must_use]
-    pub fn new(config: Config, source: Source, inherited: Vec<Uhid>) -> Self {
+    pub fn new(config: Config, source: Source, inherited: Vec<Handle>) -> Self {
         let pool = DevicePool::new(inherited, config.uhid_path.clone());
         Self {
             config,
@@ -333,8 +276,8 @@ impl Bridge {
     /// # Errors
     ///
     /// Only unrecoverable failures propagate; a headset that disappears or a
-    /// failing `headsetcontrol` call is logged and retried on the next tick.
-    pub fn run(&mut self, stop: &Arc<AtomicBool>) -> Result<()> {
+    /// failing reader is logged and retried on the next tick.
+    pub fn run(&mut self, stop: &AtomicBool) -> Result<()> {
         info!(
             "reading batteries with {} every {:?}",
             self.source.describe(),
@@ -349,7 +292,7 @@ impl Bridge {
                 let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                     break;
                 };
-                self.wait(remaining.min(MAX_POLL_SLICE))?;
+                self.wait(remaining.min(MAX_WAIT))?;
             }
         }
 
@@ -357,7 +300,7 @@ impl Bridge {
         Ok(())
     }
 
-    /// Polls HeadsetControl once and reconciles the virtual devices with it.
+    /// Reads the batteries once and reconciles the virtual devices with them.
     fn tick(&mut self) {
         let headsets = match self.source.probe() {
             Ok(headsets) => {
@@ -412,7 +355,9 @@ impl Bridge {
 
         match summary {
             Summary::NoDevice => info!(
-                "no supported headset found: check that the dongle is plugged in,                  and that this service may reach its hidraw node (run                  `headset-battery-indicator udev-rules` and install the result)"
+                "no supported headset found: check that the dongle is plugged in, and that this \
+                 service may reach its hidraw node (run `headset-battery-indicator udev-rules` \
+                 and install the result)"
             ),
             Summary::NoBattery => info!("{} found, but none reports a battery", names()),
             Summary::Offline => info!(
@@ -450,7 +395,7 @@ impl Bridge {
                     );
                     return Ok(());
                 };
-                (self.batteries[index].percent, true)
+                (self.batteries[index].device.percent(), true)
             }
             BatteryState::Unavailable => {
                 trace!("{} is offline", headset.name);
@@ -467,10 +412,11 @@ impl Bridge {
         // the level it gave us.
         battery.last_reading = now;
 
-        if vet(battery.percent, percent, battery.deferred) == Verdict::Defer {
+        let (known_percent, known_charging) = (battery.device.percent(), battery.device.charging());
+        if vet(known_percent, percent, battery.deferred) == Verdict::Defer {
             debug!(
-                "{}: holding back an implausible {percent}% (last known {}%)",
-                battery.name, battery.percent
+                "{}: holding back an implausible {percent}% (last known {known_percent}%)",
+                battery.name
             );
             battery.deferred = Some(percent);
             return Ok(());
@@ -481,24 +427,16 @@ impl Bridge {
         // reports without telling anyone while it is probing the device, so
         // this periodic push is what guarantees a lost one is made up for; it
         // rate-limits the resulting uevents itself.
-        if battery.percent == percent && battery.charging == charging {
-            return self.batteries[index].publish();
+        if known_percent != percent || known_charging != charging {
+            let suffix = if charging { ", charging" } else { "" };
+            if known_charging != charging || battery.logged_percent.abs_diff(percent) >= LOG_STEP {
+                battery.logged_percent = percent;
+                info!("{}: {percent}%{suffix}", battery.name);
+            } else {
+                debug!("{}: {percent}%{suffix}", battery.name);
+            }
         }
-
-        let worth_announcing =
-            battery.charging != charging || battery.logged_percent.abs_diff(percent) >= LOG_STEP;
-        battery.percent = percent;
-        battery.charging = charging;
-
-        let suffix = if charging { ", charging" } else { "" };
-        if worth_announcing {
-            battery.logged_percent = percent;
-            info!("{}: {percent}%{suffix}", battery.name);
-        } else {
-            debug!("{}: {percent}%{suffix}", battery.name);
-        }
-
-        self.batteries[index].publish()
+        battery.publish(percent, charging)
     }
 
     /// Registers a new virtual battery with the kernel.
@@ -509,62 +447,59 @@ impl Bridge {
         charging: bool,
         now: Instant,
     ) -> Result<()> {
-        let handle = self.pool.acquire()?;
-        let params = CreateParams {
+        let uniq = headset.uniq();
+        let identity = Identity {
             name: headset.name.clone(),
-            phys: format!("headset-battery-indicator/{}", headset.uniq()),
-            uniq: headset.uniq(),
+            phys: format!("{PHYS_PREFIX}/{uniq}"),
+            uniq: uniq.clone(),
             vendor: u32::from(headset.vendor_id),
             product: u32::from(headset.product_id),
         };
 
-        if let Err(err) = handle.create(&params, uhid::REPORT_DESCRIPTOR) {
-            self.pool.put_back(handle);
-            return Err(err).context("creating the virtual HID battery");
-        }
+        let handle = self.pool.acquire()?;
+        let mut device = match Battery::create(handle, &identity, Kind::Headset, percent, charging)
+        {
+            Ok(device) => device,
+            Err(err) => {
+                let (handle, source) = err.into_parts();
+                self.pool.put_back(handle);
+                return Err(source).context("creating the virtual HID battery");
+            }
+        };
 
-        let battery = VirtualBattery {
+        // Creating the HID device is not the goal; the power supply is. The
+        // kernel accepts a device it then builds no battery for without a
+        // word, so look for the result instead of assuming it.
+        let sysfs = match device.wait_for_power_supply(REGISTRATION_TIMEOUT) {
+            Ok(Some(sysfs)) => sysfs,
+            Ok(None) => {
+                self.pool.release(device);
+                anyhow::bail!(
+                    "the kernel created the HID device but no hid-{uniq}-battery power supply; \
+                     is CONFIG_HID_BATTERY_STRENGTH enabled? (see `journalctl -k`)"
+                );
+            }
+            Err(err) => {
+                self.pool.release(device);
+                return Err(err).context("waiting for the power supply");
+            }
+        };
+
+        info!(
+            "{} appeared: {percent}%{} ({})",
+            headset.name,
+            if charging { ", charging" } else { "" },
+            sysfs.display()
+        );
+        self.batteries.push(VirtualBattery {
             key: headset.key(),
             name: headset.name.clone(),
-            uhid: handle,
-            percent,
-            charging,
+            device,
             last_reading: now,
             last_seen: now,
             deferred: None,
             logged_percent: percent,
-            repush_at: Cell::new(None),
-        };
-        if let Err(err) = battery.publish() {
-            self.pool.release(battery.uhid);
-            return Err(err);
-        }
-
-        // Creating the HID device is not the goal; the power supply is. The
-        // kernel accepts a descriptor it then refuses to build a battery from
-        // without a word, so look for the result instead of assuming it.
-        let uniq = headset.uniq();
-        let deadline = Instant::now() + REGISTRATION_TIMEOUT;
-        let mut sysfs = uhid::find_power_supply(&uniq);
-        while sysfs.is_none() && Instant::now() < deadline {
-            battery.service()?;
-            std::thread::sleep(Duration::from_millis(50));
-            sysfs = uhid::find_power_supply(&uniq);
-        }
-        let Some(sysfs) = sysfs else {
-            self.pool.release(battery.uhid);
-            anyhow::bail!(
-                "the kernel created the HID device but no hid-{uniq}-battery power supply; is \
-                 CONFIG_HID_BATTERY_STRENGTH enabled? (see `journalctl -k`)"
-            );
-        };
-        info!(
-            "{} appeared: {percent}%{} ({})",
-            battery.name,
-            if charging { ", charging" } else { "" },
-            sysfs.display()
-        );
-        self.batteries.push(battery);
+        });
         Ok(())
     }
 
@@ -590,57 +525,45 @@ impl Bridge {
 
             let battery = self.batteries.remove(index);
             info!("{} {reason}, removing its battery", battery.name);
-            self.pool.release(battery.uhid);
+            self.pool.release(battery.device);
         }
     }
 
-    /// Waits for uhid events, for at most `timeout`.
+    /// Waits for uhid events, for at most `timeout`, then services every
+    /// battery.
+    ///
+    /// With no battery to watch this is a plain sleep, but still through
+    /// `poll()`: unlike `thread::sleep`, it returns when a signal arrives.
     fn wait(&mut self, timeout: Duration) -> Result<()> {
-        if self.batteries.is_empty() {
-            std::thread::sleep(timeout);
-            return Ok(());
-        }
+        // Wake up early only if a battery has a push of its own coming up.
+        let now = Instant::now();
+        let timeout = self
+            .batteries
+            .iter()
+            .filter_map(|battery| battery.device.next_deadline())
+            .map(|due| due.saturating_duration_since(now))
+            .fold(timeout, Duration::min);
 
         let mut fds: Vec<PollFd<'_>> = self
             .batteries
             .iter()
-            .map(|battery| PollFd::new(&battery.uhid, PollFlags::IN))
+            .map(|battery| PollFd::new(&battery.device, PollFlags::IN))
             .collect();
-
-        match crate::poll::poll(&mut fds, timeout.min(START_SETTLE_DELAY)) {
-            Ok(0) => {
-                drop(fds);
-                self.repush_due();
-                return Ok(());
-            }
+        match crate::poll::poll(&mut fds, timeout) {
             Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => return Ok(()),
             Err(err) => return Err(err).context("waiting on /dev/uhid"),
         }
-
-        let ready: Vec<usize> = fds
-            .iter()
-            .enumerate()
-            .filter(|(_, fd)| !fd.revents().is_empty())
-            .map(|(index, _)| index)
-            .collect();
         drop(fds);
 
-        for index in ready {
-            if let Err(err) = self.batteries[index].service() {
+        // Servicing is a non-blocking read, so there is no point in working
+        // out which descriptor was ready - and a due push needs it regardless.
+        for battery in &mut self.batteries {
+            if let Err(err) = battery.service() {
                 error!("{err:#}");
             }
         }
-        self.repush_due();
         Ok(())
-    }
-
-    fn repush_due(&self) {
-        for battery in &self.batteries {
-            if let Err(err) = battery.repush_if_due() {
-                error!("{err:#}");
-            }
-        }
     }
 
     /// Removes every virtual battery, so the applet does not keep a stale entry
@@ -648,9 +571,7 @@ impl Bridge {
     fn shutdown(&mut self) {
         for battery in self.batteries.drain(..) {
             debug!("withdrawing {}", battery.name);
-            if let Err(err) = battery.uhid.destroy() {
-                warn!("could not destroy {}: {err}", battery.name);
-            }
+            drop(battery.device.destroy());
         }
     }
 }

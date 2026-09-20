@@ -201,6 +201,7 @@ dependencies = [
  "serde",
  "serde_json",
  "signal-hook",
+ "uhid-battery",
 ]
 
 [[package]]
@@ -472,6 +473,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "uhid-battery"
+version = "0.1.0"
+source = "git+https://github.com/GregDuhamel/uhid-battery#c197fda9053186b47999e016edacfee07a96424d"
+dependencies = [
+ "rustix",
 ]
 
 [[package]]

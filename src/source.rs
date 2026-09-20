@@ -6,7 +6,8 @@
 
 use anyhow::Result;
 
-use crate::headsetcontrol::{Headset, HeadsetControl};
+use crate::headset::Headset;
+use crate::headsetcontrol::HeadsetControl;
 use crate::maxwell;
 
 /// Which reader to use.

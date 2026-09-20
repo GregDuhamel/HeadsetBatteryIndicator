@@ -9,12 +9,18 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use headset_battery_indicator::bridge::{Bridge, Config};
-use headset_battery_indicator::headsetcontrol::{BatteryState, HeadsetControl};
+use headset_battery_indicator::bridge::{
+    Bridge, Config, DEFAULT_INTERVAL_SECS, DEFAULT_MISSING_GRACE_SECS, DEFAULT_OFFLINE_GRACE_SECS,
+    PHYS_PREFIX,
+};
+use headset_battery_indicator::headset::BatteryState;
+use headset_battery_indicator::headsetcontrol::HeadsetControl;
 use headset_battery_indicator::source::{Backend, Source};
-use headset_battery_indicator::systemd::{self, UHID_FD_NAME};
-use headset_battery_indicator::uhid::{self, Uhid};
-use log::{LevelFilter, error, warn};
+use log::{LevelFilter, error};
+use uhid_battery::{DEV_UHID, Handle, Kind, find_power_supply};
+
+/// Name prefix of the `/dev/uhid` descriptors the unit file passes down.
+const UHID_FD_PREFIX: &str = "uhid";
 
 /// Default group granted access to the headset's hidraw nodes.
 const DEFAULT_GROUP: &str = "headset-battery";
@@ -103,22 +109,22 @@ struct CommonArgs {
 #[derive(Debug, Clone, Args)]
 struct RunArgs {
     /// Delay between two battery readings, in seconds.
-    #[arg(short, long, value_name = "SECONDS", default_value_t = 60)]
+    #[arg(short, long, value_name = "SECONDS", default_value_t = DEFAULT_INTERVAL_SECS)]
     interval: u64,
 
     /// How long a headset that is detected but no longer answering keeps its
     /// entry, in seconds. Headsets park their radio when idle; the last known
     /// level stays true meanwhile.
-    #[arg(long, value_name = "SECONDS", default_value_t = 900)]
+    #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_OFFLINE_GRACE_SECS)]
     offline_grace: u64,
 
     /// How long a headset that is no longer detected at all (dongle unplugged)
     /// keeps its entry, in seconds.
-    #[arg(long, value_name = "SECONDS", default_value_t = 180)]
+    #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_MISSING_GRACE_SECS)]
     missing_grace: u64,
 
     /// Path of the uhid character device.
-    #[arg(long, value_name = "PATH", default_value = uhid::DEV_UHID)]
+    #[arg(long, value_name = "PATH", default_value = DEV_UHID)]
     uhid: PathBuf,
 }
 
@@ -178,16 +184,9 @@ fn run(args: &RunArgs, source: Source) -> Result<()> {
             .with_context(|| format!("installing the handler for signal {signal}"))?;
     }
 
-    let inherited = systemd::take_fds(UHID_FD_NAME)
-        .into_iter()
-        .filter_map(|fd| match Uhid::from_fd(fd) {
-            Ok(handle) => Some(handle),
-            Err(err) => {
-                warn!("ignoring an inherited descriptor: {err}");
-                None
-            }
-        })
-        .collect::<Vec<_>>();
+    // `OpenFile=/dev/uhid:uhid` in the unit: systemd opens the node and passes
+    // it down, so the daemon never needs permission to open it itself.
+    let inherited = Handle::inherited(UHID_FD_PREFIX);
 
     let config = Config {
         interval: Duration::from_secs(args.interval.max(1)),
@@ -214,18 +213,18 @@ fn status(source: &Source) -> Result<()> {
             BatteryState::Charging(Some(percent)) => format!("{percent}% (charging)"),
             BatteryState::Charging(None) => "charging".to_owned(),
             BatteryState::Unavailable if headset.supports_battery => {
-                "unavailable (headset off?)".to_owned()
+                "unavailable (radio parked, or headset off)".to_owned()
             }
             BatteryState::Unavailable => "not supported by this headset".to_owned(),
         };
+        let published = find_power_supply(&headset.uniq()).map_or_else(
+            || "not published (is the daemon running?)".to_owned(),
+            |path| path.display().to_string(),
+        );
         writeln!(
             out,
-            "{} [{:04x}:{:04x}] via {}\n  battery: {battery}\n  sysfs:   hid-{}-battery*",
-            headset.name,
-            headset.vendor_id,
-            headset.product_id,
-            headset.product,
-            headset.uniq(),
+            "{} [{:04x}:{:04x}] via {}\n  battery: {battery}\n  sysfs:   {published}",
+            headset.name, headset.vendor_id, headset.product_id, headset.product,
         )?;
     }
     Ok(())
@@ -249,12 +248,12 @@ fn udev_rules(args: &UdevRulesArgs, source: &Source) -> Result<()> {
     // card. It accepts an input node as that sibling, and the virtual device
     // has one, so tagging it is all it takes to get the headset icon instead of
     // a laptop battery.
-    writeln!(
-        out,
-        "\n# Makes UPower (and the desktop) show a headset rather than a generic battery.\n\
-         SUBSYSTEM==\"input\", KERNEL==\"input*\", ATTR{{phys}}==\"headset-battery-indicator/*\", \
-         ENV{{SOUND_INITIALIZED}}=\"1\", ENV{{SOUND_FORM_FACTOR}}=\"headset\""
-    )?;
+    if let Some(rule) = Kind::Headset.udev_rule(&format!("{PHYS_PREFIX}/*")) {
+        writeln!(
+            out,
+            "\n# Makes UPower (and the desktop) show a headset rather than a generic battery.\n{rule}"
+        )?;
+    }
 
     if headsets.is_empty() {
         writeln!(out, "# No headset detected; plug the dongle in and re-run.")?;
