@@ -16,6 +16,7 @@
 //! [HeadsetControl]: https://github.com/Sapd/HeadsetControl
 
 pub mod bridge;
+pub mod headset;
 pub mod headsetcontrol;
 pub mod maxwell;
 mod poll;

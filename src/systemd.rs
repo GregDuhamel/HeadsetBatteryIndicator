@@ -23,14 +23,17 @@ const LISTEN_FDS_START: RawFd = 3;
 /// Name given to the `/dev/uhid` descriptor in the unit file.
 pub const UHID_FD_NAME: &str = "uhid";
 
-/// Takes ownership of the descriptors the service manager passed for `name`.
+/// Takes ownership of the descriptors the service manager passed under a name
+/// starting with `prefix` (`uhid`, `uhid2`, ...).
 ///
 /// Returns an empty vector when the process was not started by systemd, or
-/// when no descriptor carries that name. The environment variables are removed
+/// when no descriptor carries such a name. Descriptors passed under another
+/// name are closed: nothing here would use them, and left alone they would
+/// leak into every child process. The environment variables are removed
 /// so a re-entrant call — or a child process — cannot claim the same
 /// descriptors twice.
 #[must_use]
-pub fn take_fds(name: &str) -> Vec<OwnedFd> {
+pub fn take_fds(prefix: &str) -> Vec<OwnedFd> {
     let Some(count) = listen_fds_count() else {
         return Vec::new();
     };
@@ -38,18 +41,20 @@ pub fn take_fds(name: &str) -> Vec<OwnedFd> {
     let names = env::var("LISTEN_FDNAMES").unwrap_or_default();
     let mut names = names.split(':');
 
-    // SAFETY: the descriptors in `LISTEN_FDS_START..LISTEN_FDS_START + count`
-    // belong to this process by the systemd protocol, this is the only place
-    // that adopts them, and the variables are cleared below so nothing takes
-    // them a second time.
-    #[allow(unsafe_code)]
     let fds = (0..count)
         .filter_map(|offset| {
+            // SAFETY: the descriptors in `LISTEN_FDS_START..LISTEN_FDS_START +
+            // count` belong to this process by the systemd protocol, this is
+            // the only place that adopts them, and the variables are cleared
+            // below so nothing takes them a second time.
+            #[allow(unsafe_code)]
+            let fd = unsafe { OwnedFd::from_raw_fd(LISTEN_FDS_START + offset) };
+
             let fd_name = names.next().unwrap_or_default();
-            if fd_name == name {
-                Some(unsafe { OwnedFd::from_raw_fd(LISTEN_FDS_START + offset) })
+            if fd_name.starts_with(prefix) {
+                Some(fd)
             } else {
-                debug!("ignoring inherited descriptor named {fd_name:?}");
+                debug!("closing inherited descriptor named {fd_name:?}");
                 None
             }
         })
@@ -80,10 +85,9 @@ fn listen_fds_count() -> Option<RawFd> {
 }
 
 fn unset_listen_vars() {
-    // SAFETY-adjacent note: this runs before any thread is spawned, which is
-    // the only way `remove_var` can be misused.
     for key in ["LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"] {
-        // SAFETY: single-threaded at this point in the program.
+        // SAFETY: `remove_var` is only unsound while another thread reads the
+        // environment, and this runs during startup, before any is spawned.
         #[allow(unsafe_code)]
         unsafe {
             env::remove_var(key);

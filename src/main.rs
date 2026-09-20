@@ -9,8 +9,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use headset_battery_indicator::bridge::{Bridge, Config};
-use headset_battery_indicator::headsetcontrol::{BatteryState, HeadsetControl};
+use headset_battery_indicator::bridge::{
+    Bridge, Config, DEFAULT_INTERVAL_SECS, DEFAULT_MISSING_GRACE_SECS, DEFAULT_OFFLINE_GRACE_SECS,
+};
+use headset_battery_indicator::headset::BatteryState;
+use headset_battery_indicator::headsetcontrol::HeadsetControl;
 use headset_battery_indicator::source::{Backend, Source};
 use headset_battery_indicator::systemd::{self, UHID_FD_NAME};
 use headset_battery_indicator::uhid::{self, Uhid};
@@ -103,18 +106,18 @@ struct CommonArgs {
 #[derive(Debug, Clone, Args)]
 struct RunArgs {
     /// Delay between two battery readings, in seconds.
-    #[arg(short, long, value_name = "SECONDS", default_value_t = 60)]
+    #[arg(short, long, value_name = "SECONDS", default_value_t = DEFAULT_INTERVAL_SECS)]
     interval: u64,
 
     /// How long a headset that is detected but no longer answering keeps its
     /// entry, in seconds. Headsets park their radio when idle; the last known
     /// level stays true meanwhile.
-    #[arg(long, value_name = "SECONDS", default_value_t = 900)]
+    #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_OFFLINE_GRACE_SECS)]
     offline_grace: u64,
 
     /// How long a headset that is no longer detected at all (dongle unplugged)
     /// keeps its entry, in seconds.
-    #[arg(long, value_name = "SECONDS", default_value_t = 180)]
+    #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_MISSING_GRACE_SECS)]
     missing_grace: u64,
 
     /// Path of the uhid character device.
@@ -214,18 +217,18 @@ fn status(source: &Source) -> Result<()> {
             BatteryState::Charging(Some(percent)) => format!("{percent}% (charging)"),
             BatteryState::Charging(None) => "charging".to_owned(),
             BatteryState::Unavailable if headset.supports_battery => {
-                "unavailable (headset off?)".to_owned()
+                "unavailable (radio parked, or headset off)".to_owned()
             }
             BatteryState::Unavailable => "not supported by this headset".to_owned(),
         };
+        let published = uhid::find_power_supply(&headset.uniq()).map_or_else(
+            || "not published (is the daemon running?)".to_owned(),
+            |path| path.display().to_string(),
+        );
         writeln!(
             out,
-            "{} [{:04x}:{:04x}] via {}\n  battery: {battery}\n  sysfs:   hid-{}-battery*",
-            headset.name,
-            headset.vendor_id,
-            headset.product_id,
-            headset.product,
-            headset.uniq(),
+            "{} [{:04x}:{:04x}] via {}\n  battery: {battery}\n  sysfs:   {published}",
+            headset.name, headset.vendor_id, headset.product_id, headset.product,
         )?;
     }
     Ok(())

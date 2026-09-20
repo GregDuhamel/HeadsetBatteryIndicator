@@ -1,9 +1,8 @@
-//! The daemon itself: poll HeadsetControl, mirror what it says onto virtual
-//! HID batteries, and keep answering the kernel while it waits.
+//! The daemon itself: read the batteries, mirror them onto virtual HID
+//! batteries, and keep answering the kernel in between.
 
 use std::cell::Cell;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -11,13 +10,21 @@ use anyhow::{Context, Result};
 use log::{debug, error, info, trace, warn};
 use rustix::event::{PollFd, PollFlags};
 
-use crate::headsetcontrol::{BatteryState, Headset};
+use crate::headset::{BatteryState, Headset};
 use crate::source::Source;
 use crate::uhid::{self, CreateParams, Event, Uhid};
 
-/// How long a single `poll()` may block, so a signal is noticed promptly even
-/// if it arrives while we are idle.
-const MAX_POLL_SLICE: Duration = Duration::from_millis(500);
+/// Default delay between two readings, in seconds.
+pub const DEFAULT_INTERVAL_SECS: u64 = 60;
+/// Default for [`Config::offline_grace`], in seconds.
+pub const DEFAULT_OFFLINE_GRACE_SECS: u64 = 900;
+/// Default for [`Config::missing_grace`], in seconds.
+pub const DEFAULT_MISSING_GRACE_SECS: u64 = 180;
+
+/// The longest a single `poll()` may block. A signal interrupts `poll()`, so
+/// this only bounds the shutdown delay in the unlucky case where the signal
+/// lands between checking the stop flag and entering the call.
+const MAX_WAIT: Duration = Duration::from_secs(5);
 
 /// uhid registers the device from a worker, and hid-core drops input reports
 /// until the driver has finished probing. `UHID_START` arrives mid-probe, so
@@ -156,9 +163,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            interval: Duration::from_secs(60),
-            offline_grace: Duration::from_secs(900),
-            missing_grace: Duration::from_secs(180),
+            interval: Duration::from_secs(DEFAULT_INTERVAL_SECS),
+            offline_grace: Duration::from_secs(DEFAULT_OFFLINE_GRACE_SECS),
+            missing_grace: Duration::from_secs(DEFAULT_MISSING_GRACE_SECS),
             uhid_path: PathBuf::from(uhid::DEV_UHID),
         }
     }
@@ -333,8 +340,8 @@ impl Bridge {
     /// # Errors
     ///
     /// Only unrecoverable failures propagate; a headset that disappears or a
-    /// failing `headsetcontrol` call is logged and retried on the next tick.
-    pub fn run(&mut self, stop: &Arc<AtomicBool>) -> Result<()> {
+    /// failing reader is logged and retried on the next tick.
+    pub fn run(&mut self, stop: &AtomicBool) -> Result<()> {
         info!(
             "reading batteries with {} every {:?}",
             self.source.describe(),
@@ -349,7 +356,7 @@ impl Bridge {
                 let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                     break;
                 };
-                self.wait(remaining.min(MAX_POLL_SLICE))?;
+                self.wait(remaining.min(MAX_WAIT))?;
             }
         }
 
@@ -357,7 +364,7 @@ impl Bridge {
         Ok(())
     }
 
-    /// Polls HeadsetControl once and reconciles the virtual devices with it.
+    /// Reads the batteries once and reconciles the virtual devices with them.
     fn tick(&mut self) {
         let headsets = match self.source.probe() {
             Ok(headsets) => {
@@ -412,7 +419,9 @@ impl Bridge {
 
         match summary {
             Summary::NoDevice => info!(
-                "no supported headset found: check that the dongle is plugged in,                  and that this service may reach its hidraw node (run                  `headset-battery-indicator udev-rules` and install the result)"
+                "no supported headset found: check that the dongle is plugged in, and that this \
+                 service may reach its hidraw node (run `headset-battery-indicator udev-rules` \
+                 and install the result)"
             ),
             Summary::NoBattery => info!("{} found, but none reports a battery", names()),
             Summary::Offline => info!(
@@ -547,7 +556,12 @@ impl Bridge {
         let deadline = Instant::now() + REGISTRATION_TIMEOUT;
         let mut sysfs = uhid::find_power_supply(&uniq);
         while sysfs.is_none() && Instant::now() < deadline {
-            battery.service()?;
+            // No `?` here: bailing out would drop the handle, and a descriptor
+            // passed by the service manager cannot be opened again.
+            if let Err(err) = battery.service() {
+                self.pool.release(battery.uhid);
+                return Err(err);
+            }
             std::thread::sleep(Duration::from_millis(50));
             sysfs = uhid::find_power_supply(&uniq);
         }
@@ -595,11 +609,18 @@ impl Bridge {
     }
 
     /// Waits for uhid events, for at most `timeout`.
+    ///
+    /// With no battery to watch this is a plain sleep, but still through
+    /// `poll()`: unlike `thread::sleep`, it returns when a signal arrives.
     fn wait(&mut self, timeout: Duration) -> Result<()> {
-        if self.batteries.is_empty() {
-            std::thread::sleep(timeout);
-            return Ok(());
-        }
+        // Wake up early only if a level is waiting to be pushed again.
+        let now = Instant::now();
+        let timeout = self
+            .batteries
+            .iter()
+            .filter_map(|battery| battery.repush_at.get())
+            .map(|due| due.saturating_duration_since(now))
+            .fold(timeout, Duration::min);
 
         let mut fds: Vec<PollFd<'_>> = self
             .batteries
@@ -607,7 +628,7 @@ impl Bridge {
             .map(|battery| PollFd::new(&battery.uhid, PollFlags::IN))
             .collect();
 
-        match crate::poll::poll(&mut fds, timeout.min(START_SETTLE_DELAY)) {
+        match crate::poll::poll(&mut fds, timeout) {
             Ok(0) => {
                 drop(fds);
                 self.repush_due();

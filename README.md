@@ -276,8 +276,8 @@ sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=hidraw
 ```
 
 **`out of inherited /dev/uhid descriptors`.** You have more than one headset;
-add another `OpenFile=/dev/uhid:uhid` line to the unit — the daemon takes every
-descriptor named `uhid`.
+add an `OpenFile=/dev/uhid:uhid2` line to the unit — the daemon takes every
+descriptor whose name starts with `uhid`.
 
 ## Credits
 

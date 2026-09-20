@@ -56,7 +56,7 @@ use std::time::Duration;
 
 use log::{debug, info, trace, warn};
 
-use crate::headsetcontrol::{BatteryState, Headset};
+use crate::headset::{BatteryState, Headset};
 
 /// Audeze's USB vendor ID.
 pub const VENDOR_ID: u16 = 0x3329;
