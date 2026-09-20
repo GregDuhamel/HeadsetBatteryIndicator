@@ -75,7 +75,7 @@ hardware and falls back to HeadsetControl otherwise. `--backend native` and
 
 | Backend | Hardware | Notes |
 | --- | --- | --- |
-| `native` | Audeze Maxwell (`3329:4b18`, `3329:4b19`) | One request, about 70 ms per read. HeadsetControl does not need to be installed. |
+| `native` | Audeze Maxwell (`3329:4b18`, `3329:4b19`) | Listens to the dongle; reacts within a second to the headset coming or going. HeadsetControl does not need to be installed. |
 | `headsetcontrol` | [everything HeadsetControl supports](https://github.com/Sapd/HeadsetControl#supported-headsets) | Shells out to `headsetcontrol --battery --output json`. |
 
 ### Why a native reader for the Maxwell
@@ -165,7 +165,7 @@ Options:
       --timeout <SECONDS>      How long to wait for headsetcontrol [default: 10]
   -i, --interval <SECONDS>     Delay between two readings through headsetcontrol [default: 60]
       --native-interval <SECONDS>
-                               Delay between two readings with the native reader [default: 10]
+                               How often the native reader asks a linked headset for its level [default: 60]
       --offline-grace <SECONDS>
                                How long a detected but silent headset keeps its entry [default: 10]
       --missing-grace <SECONDS>
@@ -178,34 +178,41 @@ Options:
 
 ## When the headset is not there
 
-The entry leaves the applet within seconds of the headset being switched off,
-the way a Bluetooth peripheral's battery vanishes on disconnect, and comes back
-as quickly. The pacing is razerd's:
-
-* while the headset answers, it is read every `--native-interval` (10 s) by the
-  native reader - one request, 70 ms - or every `--interval` (60 s) through
-  HeadsetControl, which costs twenty packets and close to three seconds;
-* as soon as a reading goes unanswered, it is asked again every 3 s;
-* after `--offline-grace` (10 s) of silence the battery is withdrawn. Several
-  retries fit in there, so one lost reading never makes the entry blink.
+With the native reader the entry follows the headset to the second, because the
+dongle says when the headset comes and goes and the daemon listens for it:
 
 | Situation | What happens |
 | --- | --- |
-| Headset switched off (the dongle is still there, but nothing answers) | Withdrawn after `--offline-grace` (10 s). |
-| Dongle unplugged, or the reader failing outright | Withdrawn after `--missing-grace` (30 s). A single warning per failure streak, so an unplugged dongle does not fill the journal. |
-| Headset switched back on | Back on the next poll that answers: 10 s at most with the native reader. |
+| Headset switched off | The dongle announces it. The entry is withdrawn once the announcement has held for 3 s, so a link that drops for a second while a freshly powered headset settles does not make it blink. |
+| Headset switched on | The dongle announces it and volunteers the level: the entry is back within about a second. |
+| Dongle unplugged, or a reader failing outright | Withdrawn after `--missing-grace` (30 s). A single warning per failure streak. |
+| Headset silent without the dongle saying why | Withdrawn after `--offline-grace` (10 s), counted from the first lost reading so that a few retries fit in. |
 | Service stopped or restarted | Every virtual battery is destroyed, so no stale entry is left behind. |
 
-The journal says which state the daemon is in, once per change:
-`… is detected but not answering battery queries`, or
-`no supported headset found`.
+Through HeadsetControl there are no announcements: the headset is polled every
+`--interval` (60 s), a reading that goes unanswered is retried every 3 s, and
+the graces above apply.
 
-`--offline-grace` used to be a quarter of an hour, on the theory that headsets
-park their radio when idle and stop answering for a while. The gaps that theory
-explained turned out to be HeadsetControl misreading the Maxwell: with the
-native reader the headset was not lost once in an hour of use, and only stops
-answering when it is switched off. If you depend on a reader that does miss
-readings, raise it.
+### The native reader listens; it does not ask
+
+It fetches the dongle's report once a second - a control transfer to the dongle,
+nothing goes over the air - and only asks for the level while the headset is
+linked (every `--native-interval`, 60 s), plus at most three times per opened
+node to learn where things stand.
+
+That restraint is not politeness. An earlier version asked every ten seconds
+whether or not the headset was there. After an hour with the headset off -
+some 320 unanswered requests - the dongle's command channel was dead: audio
+still worked, but it answered no request at all, not even those addressed to
+the dongle itself, and only unplugging it brought it back. Requests for an
+absent headset most likely pile up in the dongle; whatever the cause, not
+sending them is the cure. As a second line of defence the reader stops asking
+when a headset that is announced as linked leaves three requests unanswered,
+and says so in the journal.
+
+The dongle also re-enumerates on USB a second or two after every link change,
+so its hidraw node vanishes and comes back. The daemon reopens it, carries what
+it knew across, and does not fall back to HeadsetControl for that gap.
 
 ## Noisy readings
 
