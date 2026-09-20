@@ -1,0 +1,33 @@
+# Lets the headset-battery-indicator service talk to the headset's hidraw node.
+#
+# The service runs as an unprivileged DynamicUser= with the headset-battery
+# supplementary group, so the node has to be readable by that group. Your own
+# session already gets access through uaccess; this rule is only about the
+# daemon.
+#
+# The file name matters: it has to sort before 73-seat-late.rules. That is
+# where logind's uaccess puts an ACL on the node, and once a node carries an
+# ACL, MODE= (a chmod) only moves the ACL mask - the owning group keeps whatever
+# it had when the ACL was created, which for a fresh hidraw node is nothing.
+# `stat` then shows crw-rw---- while `getfacl` says group::---.
+#
+# The lines below are examples. Generate the ones matching your hardware with:
+#
+#     headset-battery-indicator udev-rules
+#
+# and install the result as /etc/udev/rules.d/70-headset-battery-indicator.rules,
+# then reload with:
+#
+#     sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=hidraw
+
+# SteelSeries Arctis 7 (example)
+#KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="12ad", GROUP="headset-battery", MODE="0660"
+
+# Audeze Maxwell (example)
+#KERNEL=="hidraw*", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b18", GROUP="headset-battery", MODE="0660"
+
+# Makes UPower (and the desktop) show a headset rather than a generic battery.
+# UPower types a HID battery after its sibling nodes, promotes it to "headset"
+# when one carries the properties systemd puts on a sound card, and accepts an
+# input node as that sibling - which the virtual device has.
+SUBSYSTEM=="input", KERNEL=="input*", ATTR{phys}=="headset-battery-indicator/*", ENV{SOUND_INITIALIZED}="1", ENV{SOUND_FORM_FACTOR}="headset"

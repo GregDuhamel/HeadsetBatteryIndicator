@@ -1,0 +1,35 @@
+[package]
+name = "headset-battery-indicator"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Publishes the battery level reported by HeadsetControl to UPower, so wireless headsets show up in KDE's Power & Battery"
+authors = ["GregDuhamel <gregory.duhamel@gmail.com>"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/GregDuhamel/HeadsetBatteryIndicator"
+keywords = ["headset", "battery", "upower", "uhid", "kde"]
+categories = ["command-line-utilities", "os::linux-apis"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+log = "0.4"
+rustix = { version = "1.0", features = ["event", "fs", "std"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+signal-hook = { version = "0.3", default-features = false }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+
+[profile.release]
+strip = true
+lto = "thin"
+panic = "abort"

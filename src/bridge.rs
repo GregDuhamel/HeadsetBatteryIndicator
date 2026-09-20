@@ -1,0 +1,761 @@
+//! The daemon itself: poll HeadsetControl, mirror what it says onto virtual
+//! HID batteries, and keep answering the kernel while it waits.
+
+use std::cell::Cell;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use log::{debug, error, info, trace, warn};
+use rustix::event::{PollFd, PollFlags};
+
+use crate::headsetcontrol::{BatteryState, Headset};
+use crate::source::Source;
+use crate::uhid::{self, CreateParams, Event, Uhid};
+
+/// How long a single `poll()` may block, so a signal is noticed promptly even
+/// if it arrives while we are idle.
+const MAX_POLL_SLICE: Duration = Duration::from_millis(500);
+
+/// uhid registers the device from a worker, and hid-core drops input reports
+/// until the driver has finished probing. `UHID_START` arrives mid-probe, so
+/// the level is pushed again this long after it. Should that still be too
+/// early nothing breaks: the kernel queries us (`GET_REPORT`) until a push
+/// lands. (Learned the hard way in razerd, which bridges a mouse the same way.)
+const START_SETTLE_DELAY: Duration = Duration::from_millis(250);
+
+/// How long the kernel gets to register the power supply after a device is
+/// created. It happens synchronously in practice; this is slack.
+const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A reading further than this from the last known level is held back until the
+/// next poll confirms it.
+///
+/// Wireless dongles hand out the occasional bogus frame - an Audeze Maxwell
+/// will answer `0%` or `44%` between two `92%` readings - and a spurious `0%`
+/// is enough to make the desktop shout about a critical battery. No headset
+/// moves fifteen points in one polling interval, so a jump that large is either
+/// noise or a genuine change that will still be there on the next poll.
+const MAX_PLAUSIBLE_STEP: u8 = 15;
+
+/// How close a confirmation has to be to the reading it confirms.
+const CONFIRM_TOLERANCE: u8 = 5;
+
+/// Level change worth an INFO line; anything smaller is logged at debug, so a
+/// headset hovering between 91% and 92% does not fill the journal.
+const LOG_STEP: u8 = 5;
+
+/// What a poll found, coarse enough that it only changes when something worth
+/// saying happened.
+///
+/// Without this the daemon is silent both when the headset is switched off and
+/// when it cannot see the dongle at all, which are very different problems.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Summary {
+    /// HeadsetControl found no supported device.
+    NoDevice,
+    /// Devices were found, but none of them reports a battery.
+    NoBattery,
+    /// A headset is known, but it is not answering battery queries.
+    Offline,
+    /// At least one headset reported a level.
+    Online,
+}
+
+impl Summary {
+    fn of(headsets: &[Headset]) -> Self {
+        let mut with_battery = headsets.iter().filter(|h| h.supports_battery).peekable();
+        if headsets.is_empty() {
+            Self::NoDevice
+        } else if with_battery.peek().is_none() {
+            Self::NoBattery
+        } else if with_battery.all(|h| h.battery == BatteryState::Unavailable) {
+            Self::Offline
+        } else {
+            Self::Online
+        }
+    }
+}
+
+/// Why a virtual battery is being taken down, if it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Withdrawal {
+    /// Keep publishing the last known level.
+    Keep,
+    /// The headset is still detected but has not answered in a long time.
+    Silent,
+    /// HeadsetControl no longer reports the headset at all.
+    Missing,
+}
+
+/// Decides whether a battery still deserves its entry.
+///
+/// `silent_for` is the time since the last usable level, `missing_for` the
+/// time since the headset last appeared in a poll at all.
+fn withdrawal(silent_for: Duration, missing_for: Duration, config: &Config) -> Withdrawal {
+    if missing_for > config.missing_grace {
+        Withdrawal::Missing
+    } else if silent_for > config.offline_grace {
+        Withdrawal::Silent
+    } else {
+        Withdrawal::Keep
+    }
+}
+
+/// What to do with a freshly read battery level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// The reading is consistent with what we knew.
+    Accept,
+    /// The reading is too far off to be trusted on its own.
+    Defer,
+}
+
+/// Vets `candidate` against the level we last published, and against the
+/// reading we deferred on the previous poll, if any.
+fn vet(published: u8, candidate: u8, deferred: Option<u8>) -> Verdict {
+    if published.abs_diff(candidate) <= MAX_PLAUSIBLE_STEP {
+        return Verdict::Accept;
+    }
+    match deferred {
+        // The same surprising level twice in a row is a real change: a laptop
+        // that slept for a night comes back to a genuinely emptier headset.
+        Some(previous) if previous.abs_diff(candidate) <= CONFIRM_TOLERANCE => Verdict::Accept,
+        _ => Verdict::Defer,
+    }
+}
+
+/// Runtime configuration of the bridge.
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// Delay between two `headsetcontrol` invocations.
+    pub interval: Duration,
+    /// How long a headset that is still detected, but no longer answering
+    /// battery queries, keeps its entry.
+    ///
+    /// Wireless headsets park their radio after a short idle period, and the
+    /// dongle then answers `BATTERY_UNAVAILABLE` even though the headset is
+    /// on; an Audeze Maxwell does it within a couple of minutes of silence. A
+    /// parked headset is not draining, so its last known level stays true;
+    /// withdrawing the entry every time its owner stops the music would make
+    /// the applet blink all day.
+    pub offline_grace: Duration,
+    /// How long a headset that HeadsetControl no longer reports at all keeps
+    /// its entry.
+    ///
+    /// Much shorter: this is the unplugged dongle case, where the level on
+    /// screen would be a fiction. A few polls of slack absorb a transient
+    /// failure.
+    pub missing_grace: Duration,
+    /// Path of the uhid character device.
+    pub uhid_path: PathBuf,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(60),
+            offline_grace: Duration::from_secs(900),
+            missing_grace: Duration::from_secs(180),
+            uhid_path: PathBuf::from(uhid::DEV_UHID),
+        }
+    }
+}
+
+/// A virtual battery mirroring one headset.
+#[derive(Debug)]
+struct VirtualBattery {
+    key: String,
+    name: String,
+    uhid: Uhid,
+    percent: u8,
+    charging: bool,
+    /// When the headset last gave us a usable level.
+    last_reading: Instant,
+    /// When the headset was last reported by HeadsetControl at all, answering
+    /// or not.
+    last_seen: Instant,
+    /// A reading that was too far off to publish, waiting for confirmation.
+    deferred: Option<u8>,
+    /// The level the last INFO line mentioned.
+    logged_percent: u8,
+    /// When the current level has to be pushed again, because the kernel may
+    /// have dropped the previous push while it was still probing the device.
+    repush_at: Cell<Option<Instant>>,
+}
+
+impl VirtualBattery {
+    fn report(&self) -> [u8; uhid::REPORT_LEN] {
+        uhid::battery_report(self.percent, self.charging)
+    }
+
+    /// Pushes the current state to the kernel.
+    fn publish(&self) -> Result<()> {
+        self.uhid
+            .send_input(&self.report())
+            .with_context(|| format!("sending a battery report for {}", self.name))
+    }
+
+    /// Pushes the level again once the settle delay has elapsed.
+    fn repush_if_due(&self) -> Result<()> {
+        match self.repush_at.get() {
+            Some(due) if Instant::now() >= due => {
+                self.repush_at.set(None);
+                trace!(
+                    "{}: pushing the level again now that the probe is over",
+                    self.name
+                );
+                self.publish()
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Drains the kernel's event queue, answering the requests that would
+    /// otherwise block `hid-input` for five seconds each.
+    fn service(&self) -> Result<()> {
+        while let Some(event) = self
+            .uhid
+            .read_event()
+            .with_context(|| format!("reading uhid events for {}", self.name))?
+        {
+            match event {
+                Event::GetReport { id, rnum } => {
+                    trace!("{}: answering a get_report for report {rnum}", self.name);
+                    self.uhid.reply_get_report(id, &self.report())?;
+                }
+                Event::SetReport { id } => {
+                    trace!("{}: acknowledging a set_report", self.name);
+                    self.uhid.reply_set_report(id)?;
+                }
+                Event::Start => {
+                    debug!("{}: the kernel attached the virtual device", self.name);
+                    self.repush_at
+                        .set(Some(Instant::now() + START_SETTLE_DELAY));
+                }
+                Event::Open => trace!("{}: the device node was opened", self.name),
+                Event::Stop | Event::Close => {
+                    debug!("{}: the kernel detached the virtual device", self.name);
+                }
+                Event::Output => {}
+                Event::Other(kind) => trace!("{}: ignoring uhid event {kind}", self.name),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Hands out uhid handles, reusing the ones the service manager passed.
+#[derive(Debug)]
+struct DevicePool {
+    spare: Vec<Uhid>,
+    path: PathBuf,
+    /// Whether opening the device node ourselves is allowed. It is not when
+    /// systemd handed us descriptors: the node stays `root:root 0600` and the
+    /// daemon has no business reaching for it.
+    may_open: bool,
+}
+
+impl DevicePool {
+    fn new(inherited: Vec<Uhid>, path: PathBuf) -> Self {
+        let may_open = inherited.is_empty();
+        Self {
+            spare: inherited,
+            path,
+            may_open,
+        }
+    }
+
+    fn acquire(&mut self) -> Result<Uhid> {
+        if let Some(handle) = self.spare.pop() {
+            return Ok(handle);
+        }
+        anyhow::ensure!(
+            self.may_open,
+            "out of inherited /dev/uhid descriptors; pass another one with a second \
+             OpenFile=/dev/uhid:uhid2 line in the unit file"
+        );
+        Uhid::open(&self.path).with_context(|| format!("opening {}", self.path.display()))
+    }
+
+    /// Destroys the device backed by `handle` and keeps the handle for reuse.
+    fn release(&mut self, handle: Uhid) {
+        if let Err(err) = handle.destroy() {
+            warn!("could not destroy a virtual device: {err}");
+        }
+        // Drain what the kernel queued for the device we just destroyed;
+        // otherwise a stale event surfaces against the next device created on
+        // this handle, and the log reads as if it had been detached on arrival.
+        while let Ok(Some(event)) = handle.read_event() {
+            trace!("draining {event:?} from a released handle");
+        }
+        self.put_back(handle);
+    }
+
+    /// Returns a handle that never carried a device. Descriptors passed by the
+    /// service manager cannot be reopened, so losing one would leave the daemon
+    /// unable to publish anything until it is restarted.
+    fn put_back(&mut self, handle: Uhid) {
+        self.spare.push(handle);
+    }
+}
+
+/// The bridge between HeadsetControl and UPower.
+#[derive(Debug)]
+pub struct Bridge {
+    config: Config,
+    source: Source,
+    pool: DevicePool,
+    batteries: Vec<VirtualBattery>,
+    probe_failing: bool,
+    last_summary: Option<Summary>,
+}
+
+impl Bridge {
+    /// Builds a bridge from its configuration and any inherited uhid handle.
+    #[must_use]
+    pub fn new(config: Config, source: Source, inherited: Vec<Uhid>) -> Self {
+        let pool = DevicePool::new(inherited, config.uhid_path.clone());
+        Self {
+            config,
+            source,
+            pool,
+            batteries: Vec::new(),
+            probe_failing: false,
+            last_summary: None,
+        }
+    }
+
+    /// Runs until `stop` is raised, then withdraws every virtual battery.
+    ///
+    /// # Errors
+    ///
+    /// Only unrecoverable failures propagate; a headset that disappears or a
+    /// failing `headsetcontrol` call is logged and retried on the next tick.
+    pub fn run(&mut self, stop: &Arc<AtomicBool>) -> Result<()> {
+        info!(
+            "reading batteries with {} every {:?}",
+            self.source.describe(),
+            self.config.interval
+        );
+
+        while !stop.load(Ordering::Relaxed) {
+            self.tick();
+
+            let deadline = Instant::now() + self.config.interval;
+            while !stop.load(Ordering::Relaxed) {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                self.wait(remaining.min(MAX_POLL_SLICE))?;
+            }
+        }
+
+        self.shutdown();
+        Ok(())
+    }
+
+    /// Polls HeadsetControl once and reconciles the virtual devices with it.
+    fn tick(&mut self) {
+        let headsets = match self.source.probe() {
+            Ok(headsets) => {
+                if self.probe_failing {
+                    info!("battery readings are back");
+                    self.probe_failing = false;
+                }
+                self.announce(Summary::of(&headsets), &headsets);
+                headsets
+            }
+            Err(err) => {
+                // Only shout about the first failure of a streak: a dongle that
+                // is unplugged for a week should not fill the journal.
+                if self.probe_failing {
+                    debug!("still failing: {err:#}");
+                } else {
+                    warn!("could not read batteries: {err:#}");
+                    self.probe_failing = true;
+                }
+                Vec::new()
+            }
+        };
+
+        let now = Instant::now();
+        for headset in &headsets {
+            if !headset.supports_battery {
+                trace!("{} does not report a battery, skipping", headset.name);
+                continue;
+            }
+            if let Err(err) = self.apply(headset, now) {
+                error!("{}: {err:#}", headset.name);
+            }
+        }
+
+        self.expire(now);
+    }
+
+    /// Says what the poll found, but only when that changed since last time.
+    fn announce(&mut self, summary: Summary, headsets: &[Headset]) {
+        if self.last_summary == Some(summary) {
+            return;
+        }
+        self.last_summary = Some(summary);
+
+        let names = || {
+            headsets
+                .iter()
+                .map(|headset| headset.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        match summary {
+            Summary::NoDevice => info!(
+                "no supported headset found: check that the dongle is plugged in,                  and that this service may reach its hidraw node (run                  `headset-battery-indicator udev-rules` and install the result)"
+            ),
+            Summary::NoBattery => info!("{} found, but none reports a battery", names()),
+            Summary::Offline => info!(
+                "{} is detected but not answering battery queries (radio parked, or switched \
+                 off); keeping the last known level meanwhile",
+                names()
+            ),
+            // Nothing to say: the level lines speak for themselves.
+            Summary::Online => debug!("{} is answering", names()),
+        }
+    }
+
+    /// Creates or updates the virtual battery backing `headset`.
+    fn apply(&mut self, headset: &Headset, now: Instant) -> Result<()> {
+        let key = headset.key();
+        let existing = self.batteries.iter().position(|b| b.key == key);
+
+        // Being listed at all is what keeps the entry alive; answering is what
+        // refreshes the level.
+        if let Some(index) = existing {
+            self.batteries[index].last_seen = now;
+        }
+
+        let (percent, charging) = match headset.battery {
+            BatteryState::Discharging(percent) => (percent, false),
+            BatteryState::Charging(Some(percent)) => (percent, true),
+            // A headset that reports charging without a level keeps whatever
+            // we last knew; there is nothing better to show, and dropping the
+            // device would make it blink out of the applet.
+            BatteryState::Charging(None) => {
+                let Some(index) = existing else {
+                    debug!(
+                        "{} is charging but has not reported a level yet",
+                        headset.name
+                    );
+                    return Ok(());
+                };
+                (self.batteries[index].percent, true)
+            }
+            BatteryState::Unavailable => {
+                trace!("{} is offline", headset.name);
+                return Ok(());
+            }
+        };
+
+        let Some(index) = existing else {
+            return self.attach(headset, percent, charging, now);
+        };
+
+        let battery = &mut self.batteries[index];
+        // The headset answered, so it is alive even if we end up distrusting
+        // the level it gave us.
+        battery.last_reading = now;
+
+        if vet(battery.percent, percent, battery.deferred) == Verdict::Defer {
+            debug!(
+                "{}: holding back an implausible {percent}% (last known {}%)",
+                battery.name, battery.percent
+            );
+            battery.deferred = Some(percent);
+            return Ok(());
+        }
+        battery.deferred = None;
+
+        // An unchanged level is pushed all the same. The kernel drops input
+        // reports without telling anyone while it is probing the device, so
+        // this periodic push is what guarantees a lost one is made up for; it
+        // rate-limits the resulting uevents itself.
+        if battery.percent == percent && battery.charging == charging {
+            return self.batteries[index].publish();
+        }
+
+        let worth_announcing =
+            battery.charging != charging || battery.logged_percent.abs_diff(percent) >= LOG_STEP;
+        battery.percent = percent;
+        battery.charging = charging;
+
+        let suffix = if charging { ", charging" } else { "" };
+        if worth_announcing {
+            battery.logged_percent = percent;
+            info!("{}: {percent}%{suffix}", battery.name);
+        } else {
+            debug!("{}: {percent}%{suffix}", battery.name);
+        }
+
+        self.batteries[index].publish()
+    }
+
+    /// Registers a new virtual battery with the kernel.
+    fn attach(
+        &mut self,
+        headset: &Headset,
+        percent: u8,
+        charging: bool,
+        now: Instant,
+    ) -> Result<()> {
+        let handle = self.pool.acquire()?;
+        let params = CreateParams {
+            name: headset.name.clone(),
+            phys: format!("headset-battery-indicator/{}", headset.uniq()),
+            uniq: headset.uniq(),
+            vendor: u32::from(headset.vendor_id),
+            product: u32::from(headset.product_id),
+        };
+
+        if let Err(err) = handle.create(&params, uhid::REPORT_DESCRIPTOR) {
+            self.pool.put_back(handle);
+            return Err(err).context("creating the virtual HID battery");
+        }
+
+        let battery = VirtualBattery {
+            key: headset.key(),
+            name: headset.name.clone(),
+            uhid: handle,
+            percent,
+            charging,
+            last_reading: now,
+            last_seen: now,
+            deferred: None,
+            logged_percent: percent,
+            repush_at: Cell::new(None),
+        };
+        if let Err(err) = battery.publish() {
+            self.pool.release(battery.uhid);
+            return Err(err);
+        }
+
+        // Creating the HID device is not the goal; the power supply is. The
+        // kernel accepts a descriptor it then refuses to build a battery from
+        // without a word, so look for the result instead of assuming it.
+        let uniq = headset.uniq();
+        let deadline = Instant::now() + REGISTRATION_TIMEOUT;
+        let mut sysfs = uhid::find_power_supply(&uniq);
+        while sysfs.is_none() && Instant::now() < deadline {
+            battery.service()?;
+            std::thread::sleep(Duration::from_millis(50));
+            sysfs = uhid::find_power_supply(&uniq);
+        }
+        let Some(sysfs) = sysfs else {
+            self.pool.release(battery.uhid);
+            anyhow::bail!(
+                "the kernel created the HID device but no hid-{uniq}-battery power supply; is \
+                 CONFIG_HID_BATTERY_STRENGTH enabled? (see `journalctl -k`)"
+            );
+        };
+        info!(
+            "{} appeared: {percent}%{} ({})",
+            battery.name,
+            if charging { ", charging" } else { "" },
+            sysfs.display()
+        );
+        self.batteries.push(battery);
+        Ok(())
+    }
+
+    /// Withdraws batteries that have outlived their grace, saying which one.
+    fn expire(&mut self, now: Instant) {
+        let mut index = 0;
+        while index < self.batteries.len() {
+            let battery = &self.batteries[index];
+            let verdict = withdrawal(
+                now.duration_since(battery.last_reading),
+                now.duration_since(battery.last_seen),
+                &self.config,
+            );
+
+            let reason = match verdict {
+                Withdrawal::Keep => {
+                    index += 1;
+                    continue;
+                }
+                Withdrawal::Silent => "has not reported a level in a long while",
+                Withdrawal::Missing => "is no longer detected",
+            };
+
+            let battery = self.batteries.remove(index);
+            info!("{} {reason}, removing its battery", battery.name);
+            self.pool.release(battery.uhid);
+        }
+    }
+
+    /// Waits for uhid events, for at most `timeout`.
+    fn wait(&mut self, timeout: Duration) -> Result<()> {
+        if self.batteries.is_empty() {
+            std::thread::sleep(timeout);
+            return Ok(());
+        }
+
+        let mut fds: Vec<PollFd<'_>> = self
+            .batteries
+            .iter()
+            .map(|battery| PollFd::new(&battery.uhid, PollFlags::IN))
+            .collect();
+
+        match crate::poll::poll(&mut fds, timeout.min(START_SETTLE_DELAY)) {
+            Ok(0) => {
+                drop(fds);
+                self.repush_due();
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => return Ok(()),
+            Err(err) => return Err(err).context("waiting on /dev/uhid"),
+        }
+
+        let ready: Vec<usize> = fds
+            .iter()
+            .enumerate()
+            .filter(|(_, fd)| !fd.revents().is_empty())
+            .map(|(index, _)| index)
+            .collect();
+        drop(fds);
+
+        for index in ready {
+            if let Err(err) = self.batteries[index].service() {
+                error!("{err:#}");
+            }
+        }
+        self.repush_due();
+        Ok(())
+    }
+
+    fn repush_due(&self) {
+        for battery in &self.batteries {
+            if let Err(err) = battery.repush_if_due() {
+                error!("{err:#}");
+            }
+        }
+    }
+
+    /// Removes every virtual battery, so the applet does not keep a stale entry
+    /// around while the daemon is restarting.
+    fn shutdown(&mut self) {
+        for battery in self.batteries.drain(..) {
+            debug!("withdrawing {}", battery.name);
+            if let Err(err) = battery.uhid.destroy() {
+                warn!("could not destroy {}: {err}", battery.name);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headset(name: &str, supports_battery: bool, battery: BatteryState) -> Headset {
+        Headset {
+            name: name.to_owned(),
+            product: format!("{name} dongle"),
+            vendor_id: 0x3329,
+            product_id: 0x4b18,
+            supports_battery,
+            battery,
+        }
+    }
+
+    #[test]
+    fn an_empty_poll_is_told_apart_from_a_sleeping_headset() {
+        // Nothing found at all: the dongle is unplugged, or the service cannot
+        // reach its hidraw node. Those need a very different fix from a
+        // headset that is merely switched off.
+        assert_eq!(Summary::of(&[]), Summary::NoDevice);
+
+        let off = headset("Audeze Maxwell", true, BatteryState::Unavailable);
+        assert_eq!(Summary::of(std::slice::from_ref(&off)), Summary::Offline);
+
+        let no_battery = headset("Some Dongle", false, BatteryState::Unavailable);
+        assert_eq!(Summary::of(&[no_battery]), Summary::NoBattery);
+
+        let on = headset("Audeze Maxwell", true, BatteryState::Discharging(92));
+        assert_eq!(Summary::of(std::slice::from_ref(&on)), Summary::Online);
+
+        // One headset answering is enough to call the whole poll online.
+        assert_eq!(Summary::of(&[off, on]), Summary::Online);
+    }
+
+    #[test]
+    fn small_moves_are_taken_at_face_value() {
+        assert_eq!(vet(92, 91, None), Verdict::Accept);
+        assert_eq!(vet(92, 92, None), Verdict::Accept);
+        assert_eq!(vet(50, 65, None), Verdict::Accept);
+        // Exactly at the limit.
+        assert_eq!(vet(92, 77, None), Verdict::Accept);
+    }
+
+    #[test]
+    fn the_glitches_an_audeze_maxwell_actually_produces_are_held_back() {
+        // Observed on a real dongle: 92%, 0%, 92% within eighteen seconds.
+        assert_eq!(vet(92, 0, None), Verdict::Defer);
+        // And 92%, 44%, 92%.
+        assert_eq!(vet(92, 44, None), Verdict::Defer);
+        // The value that follows the glitch is back in range, so it is taken,
+        // and nothing bogus was ever published.
+        assert_eq!(vet(92, 92, Some(0)), Verdict::Accept);
+    }
+
+    #[test]
+    fn a_large_change_confirmed_by_the_next_poll_is_accepted() {
+        // A machine that slept all night comes back to an emptier headset:
+        // the first reading waits, the second one confirms it.
+        assert_eq!(vet(92, 40, None), Verdict::Defer);
+        assert_eq!(vet(92, 38, Some(40)), Verdict::Accept);
+    }
+
+    #[test]
+    fn a_second_unrelated_glitch_does_not_confirm_the_first() {
+        assert_eq!(vet(92, 0, None), Verdict::Defer);
+        assert_eq!(vet(92, 44, Some(0)), Verdict::Defer);
+    }
+
+    #[test]
+    fn a_parked_headset_keeps_its_entry_but_an_unplugged_dongle_does_not() {
+        let config = Config::default();
+        let minute = Duration::from_secs(60);
+
+        // Music paused: the radio parks, the level stops refreshing, but the
+        // headset is still listed - and still holding its charge.
+        assert_eq!(
+            withdrawal(10 * minute, Duration::ZERO, &config),
+            Withdrawal::Keep
+        );
+        // Left alone for a quarter of an hour: the level is too old to show.
+        assert_eq!(
+            withdrawal(16 * minute, Duration::ZERO, &config),
+            Withdrawal::Silent
+        );
+        // Dongle unplugged: gone in three minutes, whatever the level clock
+        // says.
+        assert_eq!(
+            withdrawal(Duration::ZERO, 4 * minute, &config),
+            Withdrawal::Missing
+        );
+        // A single failed poll must not move anything.
+        assert_eq!(withdrawal(minute, minute, &config), Withdrawal::Keep);
+    }
+
+    #[test]
+    fn default_config_is_conservative() {
+        let config = Config::default();
+        assert_eq!(config.interval, Duration::from_secs(60));
+        assert!(config.missing_grace > config.interval * 2);
+        assert!(config.offline_grace > config.missing_grace);
+        assert_eq!(config.uhid_path, PathBuf::from("/dev/uhid"));
+    }
+}

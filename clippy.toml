@@ -1,0 +1,2 @@
+# Product names that read better without backticks in prose.
+doc-valid-idents = ["UPower", "HeadsetControl", "OpenRazer", "BlueZ", ".."]

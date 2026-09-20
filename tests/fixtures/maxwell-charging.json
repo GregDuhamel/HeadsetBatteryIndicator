@@ -1,0 +1,43 @@
+{
+  "name": "HeadsetControl",
+  "version": "4.1.0-12-gca98ed4",
+  "api_version": "1.5",
+  "hidapi_version": "0.15.0",
+  "device_count": 1,
+  "devices": [
+    {
+      "status": "success",
+      "device": "Audeze Maxwell",
+      "vendor": "Audeze LLC",
+      "product": "Audeze Maxwell XBOX Dongle",
+      "id_vendor": "0x3329",
+      "id_product": "0x4b18",
+      "capabilities": [
+        "CAP_SIDETONE",
+        "CAP_BATTERY_STATUS",
+        "CAP_INACTIVE_TIME",
+        "CAP_CHATMIX_STATUS",
+        "CAP_VOICE_PROMPTS",
+        "CAP_EQUALIZER_PRESET",
+        "CAP_VOLUME_LIMITER",
+        "CAP_NOISE_FILTER"
+      ],
+      "capabilities_str": [
+        "sidetone",
+        "battery",
+        "inactive time",
+        "chatmix",
+        "voice prompts",
+        "equalizer preset",
+        "volume limiter",
+        "microphone noise filter"
+      ],
+      "battery": {
+        "status": "BATTERY_CHARGING",
+        "level": 64
+      },
+      "equalizer_presets_count": 10,
+      "chatmix": 89
+    }
+  ]
+}

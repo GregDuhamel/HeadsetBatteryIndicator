@@ -1,0 +1,63 @@
+[Unit]
+Description=Headset battery bridge to UPower (virtual HID battery)
+Documentation=https://github.com/GregDuhamel/HeadsetBatteryIndicator
+After=systemd-udevd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/headset-battery-indicator run --interval 60
+Restart=always
+RestartSec=10
+
+# /dev/uhid lets its holder create arbitrary input devices, so nobody is
+# granted access to it: the node stays root:root 0600, the service manager
+# opens it and passes the descriptor, and the process runs as a throwaway
+# unprivileged user whose only other device is the headset's hidraw node (via
+# the headset-battery group from the udev rule).
+OpenFile=/dev/uhid:uhid
+DynamicUser=yes
+SupplementaryGroups=headset-battery
+DevicePolicy=closed
+DeviceAllow=char-hidraw rw
+# Needed for OpenFile= itself: systemd opens the node from inside this unit's
+# device cgroup. It does not let the process open it - root:root 0600 still
+# applies, and the process is neither root nor holds any capability.
+DeviceAllow=/dev/uhid rw
+
+# No capabilities, no network, a read-only view of the system.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+PrivateNetwork=yes
+IPAddressDeny=any
+# libudev, which headsetcontrol uses to enumerate hidraw nodes, talks to
+# systemd-udevd over a local socket.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+KeyringMode=private
+UMask=0077
+SystemCallArchitectures=native
+# Broader than an allow-list would be, because this service execs a third-party
+# binary (headsetcontrol) whose syscall use is not ours to pin down.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @debug @mount @cpu-emulation @module @raw-io @reboot @swap
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
