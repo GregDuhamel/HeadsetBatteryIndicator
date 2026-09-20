@@ -297,14 +297,19 @@ fn fresh(frame: &[u8]) -> &[u8] {
     frame.get(PAYLOAD_OFFSET..end).unwrap_or_default()
 }
 
-/// Finds the battery answer in the fresh part of an input report and
-/// range-checks the level.
+/// Finds the most recent battery answer in the fresh part of an input report
+/// and range-checks the level.
+///
+/// The fresh part is a stream, oldest message first, and it holds several
+/// answers when requests were sent faster than the report was fetched - so the
+/// one that counts is the last. A message cut off by the end of the buffer is
+/// skipped: there is no telling what its level byte was.
 fn parse_battery(frame: &[u8]) -> Option<u8> {
     fresh(frame)
         .windows(BATTERY_ANSWER.len() + 1)
-        .find(|window| window.starts_with(&BATTERY_ANSWER))
+        .filter(|window| window.starts_with(&BATTERY_ANSWER))
         .map(|window| window[BATTERY_ANSWER.len()])
-        .filter(|level| *level <= 100)
+        .rfind(|level| *level <= 100)
 }
 
 /// `HIDIOCGINPUT`: fetches the current value of an input report.
@@ -376,6 +381,30 @@ mod tests {
     }
 
     #[test]
+    fn the_newest_of_several_answers_wins() {
+        // Captured while the headset was coming up: the buffer is full (59 fresh
+        // bytes), starts in the middle of a message, and holds one answer at 99%
+        // followed by newer ones at 100%.
+        let mut frame = [0u8; MSG_SIZE];
+        frame[0] = REPLY_REPORT_ID;
+        frame[FRESH_LEN_OFFSET] = 59;
+        frame[2] = 0x80;
+        let ack = [0x05, 0x5b, 0x03, 0x00, 0xd6, 0x0c, 0x00];
+        let answer = |level: u8| [0x05, 0x5d, 0x05, 0x00, 0xd6, 0x0c, 0x00, 0x00, level];
+        let stream: Vec<u8> = [0x00, 0xd6, 0x0c, 0x00] // tail of a cut-off message
+            .into_iter()
+            .chain(answer(99))
+            .chain(ack)
+            .chain(answer(100))
+            .chain(ack)
+            .chain(answer(100))
+            .collect();
+        frame[PAYLOAD_OFFSET..PAYLOAD_OFFSET + stream.len()].copy_from_slice(&stream);
+
+        assert_eq!(parse_battery(&frame), Some(100));
+    }
+
+    #[test]
     fn leftovers_from_earlier_exchanges_are_not_an_answer() {
         // Without the fresh-byte count this frame reads 92% for ever, which is
         // what a switched-off headset would look like.
@@ -425,7 +454,10 @@ mod tests {
     fn a_fresh_count_larger_than_the_frame_does_not_panic() {
         let mut frame = FRESH_FRAME;
         frame[FRESH_LEN_OFFSET] = 0xff;
-        assert_eq!(parse_battery(&frame), Some(92));
+        // The count is clamped to the buffer. Everything then counts as fresh,
+        // so the last answer in the buffer wins: the 91% that was a leftover
+        // while the count still said sixteen.
+        assert_eq!(parse_battery(&frame), Some(91));
     }
 
     #[test]

@@ -10,8 +10,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use headset_battery_indicator::bridge::{
-    Bridge, Config, DEFAULT_INTERVAL_SECS, DEFAULT_MISSING_GRACE_SECS, DEFAULT_OFFLINE_GRACE_SECS,
-    PHYS_PREFIX,
+    Bridge, Config, DEFAULT_INTERVAL_SECS, DEFAULT_MISSING_GRACE_SECS,
+    DEFAULT_NATIVE_INTERVAL_SECS, DEFAULT_OFFLINE_GRACE_SECS, PHYS_PREFIX,
 };
 use headset_battery_indicator::headset::BatteryState;
 use headset_battery_indicator::headsetcontrol::HeadsetControl;
@@ -108,13 +108,17 @@ struct CommonArgs {
 
 #[derive(Debug, Clone, Args)]
 struct RunArgs {
-    /// Delay between two battery readings, in seconds.
+    /// Delay between two readings through headsetcontrol, in seconds.
     #[arg(short, long, value_name = "SECONDS", default_value_t = DEFAULT_INTERVAL_SECS)]
     interval: u64,
 
-    /// How long a headset that is detected but no longer answering keeps its
-    /// entry, in seconds. Headsets park their radio when idle; the last known
-    /// level stays true meanwhile.
+    /// Delay between two readings with the native reader, which is cheap enough
+    /// to notice within seconds that the headset was switched off, in seconds.
+    #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_NATIVE_INTERVAL_SECS)]
+    native_interval: u64,
+
+    /// How long a headset that is detected but no longer answering (switched
+    /// off, typically) keeps its entry, in seconds.
     #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_OFFLINE_GRACE_SECS)]
     offline_grace: u64,
 
@@ -190,6 +194,7 @@ fn run(args: &RunArgs, source: Source) -> Result<()> {
 
     let config = Config {
         interval: Duration::from_secs(args.interval.max(1)),
+        native_interval: Duration::from_secs(args.native_interval.max(1)),
         offline_grace: Duration::from_secs(args.offline_grace),
         missing_grace: Duration::from_secs(args.missing_grace),
         uhid_path: args.uhid.clone(),
@@ -213,7 +218,7 @@ fn status(source: &Source) -> Result<()> {
             BatteryState::Charging(Some(percent)) => format!("{percent}% (charging)"),
             BatteryState::Charging(None) => "charging".to_owned(),
             BatteryState::Unavailable if headset.supports_battery => {
-                "unavailable (radio parked, or headset off)".to_owned()
+                "unavailable (headset off?)".to_owned()
             }
             BatteryState::Unavailable => "not supported by this headset".to_owned(),
         };

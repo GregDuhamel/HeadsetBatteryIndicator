@@ -163,11 +163,13 @@ Options:
       --backend <BACKEND>      auto, native or headsetcontrol [default: auto]
       --headsetcontrol <PATH>  Path to the headsetcontrol binary [default: headsetcontrol]
       --timeout <SECONDS>      How long to wait for headsetcontrol [default: 10]
-  -i, --interval <SECONDS>     Delay between two battery readings [default: 60]
+  -i, --interval <SECONDS>     Delay between two readings through headsetcontrol [default: 60]
+      --native-interval <SECONDS>
+                               Delay between two readings with the native reader [default: 10]
       --offline-grace <SECONDS>
-                               How long a detected but silent headset keeps its entry [default: 900]
+                               How long a detected but silent headset keeps its entry [default: 10]
       --missing-grace <SECONDS>
-                               How long an undetected headset keeps its entry [default: 180]
+                               How long an undetected headset keeps its entry [default: 30]
       --uhid <PATH>            Path of the uhid character device [default: /dev/uhid]
   -v, --verbose...             -v for debug, -vv for trace
 ```
@@ -176,23 +178,34 @@ Options:
 
 ## When the headset is not there
 
-Wireless headsets park their radio after a short idle period — an Audeze
-Maxwell does it within a couple of minutes of silence — and the dongle then
-answers `BATTERY_UNAVAILABLE` even though the headset is switched on.
-Neither backend can tell that apart from a headset that is off (HeadsetControl's
-`--connected` flag is derived from the very same battery query), so the daemon
-runs two clocks instead:
+The entry leaves the applet within seconds of the headset being switched off,
+the way a Bluetooth peripheral's battery vanishes on disconnect, and comes back
+as quickly. The pacing is razerd's:
+
+* while the headset answers, it is read every `--native-interval` (10 s) by the
+  native reader - one request, 70 ms - or every `--interval` (60 s) through
+  HeadsetControl, which costs twenty packets and close to three seconds;
+* as soon as a reading goes unanswered, it is asked again every 3 s;
+* after `--offline-grace` (10 s) of silence the battery is withdrawn. Several
+  retries fit in there, so one lost reading never makes the entry blink.
 
 | Situation | What happens |
 | --- | --- |
-| Headset detected but not answering (radio parked, or switched off) | The entry **stays**, showing the last known level — a parked headset is not draining, so that level is still true. It is withdrawn after `--offline-grace` (15 min). |
-| Headset no longer reported at all (dongle unplugged, `headsetcontrol` failing) | The entry is withdrawn after `--missing-grace` (3 min): a level on screen would be fiction. A single warning per failure streak, so an unplugged dongle does not fill the journal. |
-| Headset never answered since the daemon started | Nothing is published until a first level is read. |
+| Headset switched off (the dongle is still there, but nothing answers) | Withdrawn after `--offline-grace` (10 s). |
+| Dongle unplugged, or the reader failing outright | Withdrawn after `--missing-grace` (30 s). A single warning per failure streak, so an unplugged dongle does not fill the journal. |
+| Headset switched back on | Back on the next poll that answers: 10 s at most with the native reader. |
 | Service stopped or restarted | Every virtual battery is destroyed, so no stale entry is left behind. |
 
 The journal says which state the daemon is in, once per change:
 `… is detected but not answering battery queries`, or
 `no supported headset found`.
+
+`--offline-grace` used to be a quarter of an hour, on the theory that headsets
+park their radio when idle and stop answering for a while. The gaps that theory
+explained turned out to be HeadsetControl misreading the Maxwell: with the
+native reader the headset was not lost once in an hour of use, and only stops
+answering when it is switched off. If you depend on a reader that does miss
+readings, raise it.
 
 ## Noisy readings
 

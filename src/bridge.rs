@@ -13,12 +13,19 @@ use crate::headset::{BatteryState, Headset};
 use crate::source::Source;
 use uhid_battery::{Battery, DEV_UHID, Handle, Identity, Kind};
 
-/// Default delay between two readings, in seconds.
+/// Default for [`Config::interval`], in seconds.
 pub const DEFAULT_INTERVAL_SECS: u64 = 60;
+/// Default for [`Config::native_interval`], in seconds.
+pub const DEFAULT_NATIVE_INTERVAL_SECS: u64 = 10;
 /// Default for [`Config::offline_grace`], in seconds.
-pub const DEFAULT_OFFLINE_GRACE_SECS: u64 = 900;
+pub const DEFAULT_OFFLINE_GRACE_SECS: u64 = 10;
 /// Default for [`Config::missing_grace`], in seconds.
-pub const DEFAULT_MISSING_GRACE_SECS: u64 = 180;
+pub const DEFAULT_MISSING_GRACE_SECS: u64 = 30;
+
+/// Once a poll goes unanswered, how soon to ask again. Several retries fit in
+/// the grace, so one lost reading never makes the entry flap - and withdrawing
+/// is cheap to undo, the battery is back on the first poll that answers.
+const UNANSWERED_RETRY: Duration = Duration::from_secs(3);
 
 /// The longest a single `poll()` may block. A signal interrupts `poll()`, so
 /// this only bounds the shutdown delay in the unlucky case where the signal
@@ -82,6 +89,25 @@ impl Summary {
     }
 }
 
+/// How long to wait before the next poll.
+///
+/// Same shape as razerd's pacing: a battery that just went quiet is asked again
+/// shortly, so that it is withdrawn within seconds of the headset being switched
+/// off rather than a minute later; otherwise the cadence is whatever the reader
+/// that answered can afford.
+fn next_delay(unanswered: bool, native: bool, config: &Config) -> Duration {
+    let regular = if native {
+        config.native_interval.min(config.interval)
+    } else {
+        config.interval
+    };
+    if unanswered {
+        UNANSWERED_RETRY.min(regular)
+    } else {
+        regular
+    }
+}
+
 /// Why a virtual battery is being taken down, if it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Withdrawal {
@@ -133,24 +159,27 @@ fn vet(published: u8, candidate: u8, deferred: Option<u8>) -> Verdict {
 /// Runtime configuration of the bridge.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Delay between two `headsetcontrol` invocations.
+    /// Delay between two readings through HeadsetControl, which is expensive:
+    /// twenty packets and close to three seconds each.
     pub interval: Duration,
+    /// Delay between two readings when the native reader answers. One request,
+    /// 70 ms: cheap enough to notice within seconds that the headset was
+    /// switched off, or on again.
+    pub native_interval: Duration,
     /// How long a headset that is still detected, but no longer answering
-    /// battery queries, keeps its entry.
+    /// battery queries, keeps its entry: long enough for a few retries, so one
+    /// lost reading does not make the applet blink, and no longer - the way a
+    /// Bluetooth peripheral's battery vanishes on disconnect.
     ///
-    /// Wireless headsets park their radio after a short idle period, and the
-    /// dongle then answers `BATTERY_UNAVAILABLE` even though the headset is
-    /// on; an Audeze Maxwell does it within a couple of minutes of silence. A
-    /// parked headset is not draining, so its last known level stays true;
-    /// withdrawing the entry every time its owner stops the music would make
-    /// the applet blink all day.
+    /// It used to be a quarter of an hour, on the theory that headsets park
+    /// their radio when idle. The gaps that theory explained turned out to be
+    /// HeadsetControl misreading the Maxwell; a headset that stops answering a
+    /// reader that does not miss has been switched off.
     pub offline_grace: Duration,
-    /// How long a headset that HeadsetControl no longer reports at all keeps
-    /// its entry.
-    ///
-    /// Much shorter: this is the unplugged dongle case, where the level on
-    /// screen would be a fiction. A few polls of slack absorb a transient
-    /// failure.
+    /// How long a headset that is no longer reported at all keeps its entry:
+    /// the unplugged dongle, or a reader failing outright. A little longer than
+    /// [`Config::offline_grace`], because a failing `headsetcontrol` takes
+    /// seconds per attempt.
     pub missing_grace: Duration,
     /// Path of the uhid character device.
     pub uhid_path: PathBuf,
@@ -160,6 +189,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             interval: Duration::from_secs(DEFAULT_INTERVAL_SECS),
+            native_interval: Duration::from_secs(DEFAULT_NATIVE_INTERVAL_SECS),
             offline_grace: Duration::from_secs(DEFAULT_OFFLINE_GRACE_SECS),
             missing_grace: Duration::from_secs(DEFAULT_MISSING_GRACE_SECS),
             uhid_path: PathBuf::from(DEV_UHID),
@@ -279,15 +309,21 @@ impl Bridge {
     /// failing reader is logged and retried on the next tick.
     pub fn run(&mut self, stop: &AtomicBool) -> Result<()> {
         info!(
-            "reading batteries with {} every {:?}",
+            "reading batteries with {} (every {:?} natively, {:?} otherwise)",
             self.source.describe(),
+            self.config.native_interval,
             self.config.interval
         );
 
         while !stop.load(Ordering::Relaxed) {
-            self.tick();
+            let unanswered = self.tick();
+            let delay = next_delay(
+                unanswered,
+                self.source.last_probe_was_native(),
+                &self.config,
+            );
 
-            let deadline = Instant::now() + self.config.interval;
+            let deadline = Instant::now() + delay;
             while !stop.load(Ordering::Relaxed) {
                 let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                     break;
@@ -301,7 +337,10 @@ impl Bridge {
     }
 
     /// Reads the batteries once and reconciles the virtual devices with them.
-    fn tick(&mut self) {
+    ///
+    /// Returns whether a published battery went unanswered, which calls for a
+    /// prompt retry rather than the usual wait.
+    fn tick(&mut self) -> bool {
         let headsets = match self.source.probe() {
             Ok(headsets) => {
                 if self.probe_failing {
@@ -336,6 +375,9 @@ impl Bridge {
         }
 
         self.expire(now);
+        self.batteries
+            .iter()
+            .any(|battery| battery.last_reading != now)
     }
 
     /// Says what the poll found, but only when that changed since last time.
@@ -361,8 +403,8 @@ impl Bridge {
             ),
             Summary::NoBattery => info!("{} found, but none reports a battery", names()),
             Summary::Offline => info!(
-                "{} is detected but not answering battery queries (radio parked, or switched \
-                 off); keeping the last known level meanwhile",
+                "{} is detected but not answering battery queries (switched off?); keeping its \
+                 entry for a few more polls",
                 names()
             ),
             // Nothing to say: the level lines speak for themselves.
@@ -646,37 +688,59 @@ mod tests {
     }
 
     #[test]
-    fn a_parked_headset_keeps_its_entry_but_an_unplugged_dongle_does_not() {
+    fn a_silent_headset_outlives_a_few_retries_and_no_more() {
         let config = Config::default();
-        let minute = Duration::from_secs(60);
+        let second = Duration::from_secs(1);
 
-        // Music paused: the radio parks, the level stops refreshing, but the
-        // headset is still listed - and still holding its charge.
+        // One or two lost readings: still listed, keep the entry.
         assert_eq!(
-            withdrawal(10 * minute, Duration::ZERO, &config),
+            withdrawal(6 * second, Duration::ZERO, &config),
             Withdrawal::Keep
         );
-        // Left alone for a quarter of an hour: the level is too old to show.
+        // Switched off: the dongle is still there, but nothing answers.
         assert_eq!(
-            withdrawal(16 * minute, Duration::ZERO, &config),
+            withdrawal(11 * second, Duration::ZERO, &config),
             Withdrawal::Silent
         );
-        // Dongle unplugged: gone in three minutes, whatever the level clock
-        // says.
+        // Dongle unplugged: gone a little later, whatever the level clock says.
         assert_eq!(
-            withdrawal(Duration::ZERO, 4 * minute, &config),
+            withdrawal(Duration::ZERO, 20 * second, &config),
+            Withdrawal::Keep
+        );
+        assert_eq!(
+            withdrawal(Duration::ZERO, 31 * second, &config),
             Withdrawal::Missing
         );
-        // A single failed poll must not move anything.
-        assert_eq!(withdrawal(minute, minute, &config), Withdrawal::Keep);
+    }
+
+    #[test]
+    fn the_cadence_follows_what_the_reader_can_afford() {
+        let config = Config::default();
+        // The native reader is cheap: look often, to notice a power-off quickly.
+        assert_eq!(next_delay(false, true, &config), Duration::from_secs(10));
+        // HeadsetControl is not.
+        assert_eq!(next_delay(false, false, &config), Duration::from_secs(60));
+        // A battery that just went quiet is asked again at once, either way.
+        assert_eq!(next_delay(true, true, &config), UNANSWERED_RETRY);
+        assert_eq!(next_delay(true, false, &config), UNANSWERED_RETRY);
+
+        // Several retries fit in the grace, so one lost reading never flaps it.
+        assert!(config.offline_grace >= UNANSWERED_RETRY * 3);
+
+        // A user asking for a slow cadence gets it for both readers.
+        let lazy = Config {
+            interval: Duration::from_secs(5),
+            ..Config::default()
+        };
+        assert_eq!(next_delay(false, true, &lazy), Duration::from_secs(5));
     }
 
     #[test]
     fn default_config_is_conservative() {
         let config = Config::default();
         assert_eq!(config.interval, Duration::from_secs(60));
-        assert!(config.missing_grace > config.interval * 2);
-        assert!(config.offline_grace > config.missing_grace);
+        assert!(config.native_interval < config.interval);
+        assert!(config.missing_grace > config.offline_grace);
         assert_eq!(config.uhid_path, PathBuf::from("/dev/uhid"));
     }
 }
