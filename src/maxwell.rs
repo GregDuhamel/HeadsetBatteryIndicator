@@ -4,55 +4,66 @@
 //! HeadsetControl supports the Maxwell, but reads its battery unreliably: it
 //! replays a twenty-packet sequence and expects the battery answer to sit in
 //! the buffer of a *different* request, one frame later. When the dongle is a
-//! few milliseconds late the answer is missed and the headset is reported as
-//! unavailable while music is playing on it. It also scans for `d6 0c 00 00`
-//! anywhere in the frame, which matches the dongle's acknowledgement as well as
-//! its answer - hence the stray `0%` and `44%` readings (`0x2c`, 44, is all
-//! over those frames).
+//! few milliseconds late the answer is missed. It also scans for `d6 0c 00 00`
+//! anywhere in the dongle's report, leftovers included - hence stray `0%` and
+//! `44%` readings, and a level reported for a headset that is switched off.
 //!
-//! The dongle's input report is in fact a stream of small messages:
+//! # The report
+//!
+//! The dongle's input report is a stream of small messages, oldest first, and
+//! its second byte counts the bytes written since the report was last fetched;
+//! whatever lies beyond is left over from earlier exchanges.
 //!
 //! ```text
 //! 05 <type> <len> 00 <payload; len bytes>
 //!
-//! 05 5b 03 00  d6 0c 00          acknowledgement of request d6 0c
-//! 05 5d 05 00  d6 0c 00 00 5b    answer to request d6 0c: 0x5b = 91 %
+//! 05 5b 03 00  d6 0c 00                   acknowledgement of request d6 0c
+//! 05 5d 05 00  d6 0c 00 00 5b             answer to d6 0c: 0x5b = 91 %
+//! 05 5d 0e 00  b1 2c 00 02 01 01 <addr>…  link event: 01 = headset linked
+//! 05 5d 0e 00  b1 2c 00 02 00 01 <addr>…  link event: 00 = headset gone
 //! ```
 //!
-//! The report is a buffer the dongle fills from the start, and its second byte
-//! counts the bytes written since the report was last fetched; whatever lies
-//! beyond that is left over from earlier exchanges. Ignoring the count means
-//! reading an old answer back - for ever, once the headset is switched off.
+//! The answers are only available through a `GET_REPORT` control transfer
+//! (`HIDIOCGINPUT`); the dongle never pushes them on the interrupt endpoint.
 //!
-//! ```text
-//! 07 10 80 | 05 5b 03 00 d6 0c 00 | 05 5d 05 00 d6 0c 00 00 5c | <stale bytes>
-//!    ^^ 16 fresh bytes: the acknowledgement (7) and the answer (9)
-//! ```
+//! # Listen, do not ask
+//!
+//! The dongle announces the headset's link state on its own, and volunteers the
+//! battery level when the headset connects. So the reader is passive: it
+//! fetches the report about once a second - a control transfer to the dongle,
+//! nothing goes over the air - and only *asks* for the level while the headset
+//! is known to be linked, plus a handful of times per opened node - the first after
+//! listening for a few seconds - to learn where things stand.
+//!
+//! That restraint is not politeness. A daemon that kept sending a request every
+//! ten seconds to a headset that was switched off left the dongle's command
+//! channel dead after an hour or so: audio still worked, but it answered no
+//! request at all, not even those addressed to the dongle itself, and only a
+//! power cycle brought it back. The likeliest explanation is that requests for
+//! an absent headset pile up in the dongle; whatever the cause, not sending
+//! them is the cure. As a second line of defence the reader stops asking when
+//! a headset that is supposed to be linked stops answering.
+//!
+//! The dongle also re-enumerates on USB a second or two after every link
+//! change, so its hidraw node vanishes and comes back; the reader reopens it.
 //!
 //! # Charging
 //!
 //! Nothing the dongle answers changes when the headset is charging: every
-//! register it exposes to a read (`01 09 00`-`3f`, `83 2c 00`-`0f`, `d6 0c`,
-//! `07 1c`) was compared plugged and unplugged, and only the level moved.
-//!
-//! What does change is the USB bus. Plugged into the computer, the headset
-//! enumerates as a device of its own (`3329:4b1e`, "Audeze Maxwell XBOX
-//! Headset") next to the dongle, and disappears when the cable is pulled. Its
-//! presence is therefore what this module reports as charging. The limit is
-//! obvious: a headset charging from a wall adapter is invisible, and keeps
-//! reading as discharging.
-//!
-//! So this module sends the one request that matters, polls the input report
-//! until the *answer* message shows up, and range-checks the level. Measured on
-//! a Maxwell Xbox dongle: every read succeeds, in about 70 ms instead of 2.7 s.
+//! register it exposes to a read was compared plugged and unplugged, and only
+//! the level moved. What does change is the USB bus. Plugged into the computer,
+//! the headset enumerates as a device of its own (`3329:4b1e`) next to the
+//! dongle. Its presence is what this module reports as charging; a headset on a
+//! wall charger is invisible, and keeps reading as discharging.
 
-use std::fs::{self, OpenOptions};
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use log::{debug, info, trace, warn};
 
@@ -66,6 +77,9 @@ pub const PRODUCT_IDS: [u16; 2] = [
     0x4b19, // Maxwell dongle
     0x4b18, // Maxwell Xbox dongle
 ];
+
+/// Where the kernel lists hidraw nodes.
+const HIDRAW_CLASS: &str = "/sys/class/hidraw";
 
 /// Where the kernel lists USB devices.
 const USB_DEVICES: &str = "/sys/bus/usb/devices";
@@ -82,7 +96,8 @@ const MSG_SIZE: usize = 62;
 /// Report ID of the dongle's answers.
 const REPLY_REPORT_ID: u8 = 0x07;
 
-/// "What is the battery level?", on output report `0x06`.
+/// "What is the battery level?", on output report `0x06`, relayed to the
+/// headset (the `0x80` in third position; `0x00` addresses the dongle itself).
 const BATTERY_REQUEST: [u8; 9] = [0x06, 0x07, 0x80, 0x05, 0x5a, 0x03, 0x00, 0xd6, 0x0c];
 
 /// Offset of the count of fresh bytes in an input report.
@@ -91,24 +106,46 @@ const FRESH_LEN_OFFSET: usize = 1;
 /// Offset of the first message in an input report.
 const PAYLOAD_OFFSET: usize = 3;
 
-/// Header of the answer: message type `0x5d`, five payload bytes, echoing the
-/// request (`d6 0c`) with a zero status. The level is the byte that follows.
+/// Header of the battery answer: message type `0x5d`, five payload bytes,
+/// echoing the request (`d6 0c`) with a zero status. The level follows.
 const BATTERY_ANSWER: [u8; 7] = [0x5d, 0x05, 0x00, 0xd6, 0x0c, 0x00, 0x00];
 
-/// The dongle needs a moment between a request and its answer; Audeze's own
-/// software paces itself at about this rate.
-const READ_DELAY: Duration = Duration::from_millis(60);
+/// Header of a link event. The byte that follows is `01` when the headset is
+/// linked and `00` when it is gone; then come a `01` and the headset's address.
+const LINK_EVENT: [u8; 7] = [0x5d, 0x0e, 0x00, 0xb1, 0x2c, 0x00, 0x02];
 
-/// How many times the input report is polled for the answer. The answer has
-/// always been there on the first read in testing; the rest is slack for a
-/// dongle that is busy relaying audio.
-const READ_ATTEMPTS: u32 = 8;
+/// How often, and how many times, a one-shot reading looks for its answer.
+const ANSWER_DELAY: Duration = Duration::from_millis(60);
+const ANSWER_POLLS: u32 = 10;
 
-/// The last access error reported, so a broken setup is announced once rather
-/// than on every poll.
-static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+/// Requests a linked headset may leave unanswered before the reader stops
+/// asking. See the module documentation for why it must stop.
+const MAX_UNANSWERED: u32 = 3;
 
-/// Reports a failure to reach a dongle that sysfs says is there.
+/// After opening a dongle, listen this long before asking anything: if the
+/// headset is there the dongle usually says so on its own, and if it just left
+/// there is nobody to ask.
+const LISTEN_FIRST: Duration = Duration::from_secs(3);
+
+/// How long to wait before asking again a session that has heard nothing, one
+/// entry per extra question. A single request does get lost now and then, and
+/// a lone question would leave a headset that is on unnoticed until it is
+/// switched off and on again. Three questions per session is the ceiling: the
+/// dongle re-enumerates whenever the headset comes or goes, which opens a new
+/// session, so a session still silent after these has nobody behind it.
+const ASK_AGAIN_AFTER: [Duration; 2] = [Duration::from_secs(10), Duration::from_secs(30)];
+
+/// How long an access error has to last before it is worth a warning. Right
+/// after the dongle re-enumerates its new node exists for a moment without the
+/// permissions udev is about to give it, and that happens at every link change.
+const ERROR_SETTLE: Duration = Duration::from_secs(5);
+
+/// The access error being watched: its text, since when, and whether it has
+/// been reported yet - once it has, it is not reported again.
+static LAST_ERROR: Mutex<Option<(String, Instant, bool)>> = Mutex::new(None);
+
+/// Reports a failure to reach a dongle that sysfs says is there, once it has
+/// lasted.
 ///
 /// This is loud on purpose. A dongle that is listed but cannot be opened looks,
 /// from the outside, exactly like a headset that is switched off - and the
@@ -119,8 +156,14 @@ fn report_error(node: &Path, err: &io::Error) {
     let mut last = LAST_ERROR
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if last.as_deref() == Some(message.as_str()) {
-        debug!("still failing: {message}");
+
+    let (since, reported) = match last.as_ref() {
+        Some((previous, since, reported)) if *previous == message => (*since, *reported),
+        _ => (Instant::now(), false),
+    };
+    if reported || since.elapsed() < ERROR_SETTLE {
+        debug!("cannot reach {message}");
+        *last = Some((message, since, reported));
         return;
     }
 
@@ -134,14 +177,15 @@ fn report_error(node: &Path, err: &io::Error) {
     } else {
         warn!("cannot query {message}");
     }
-    *last = Some(message);
+    *last = Some((message, since, true));
 }
 
 fn report_recovery() {
     let mut last = LAST_ERROR
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if last.take().is_some() {
+    // Only worth a line if the failure was.
+    if let Some((_, _, true)) = last.take() {
         info!("the dongle is reachable again");
     }
 }
@@ -172,46 +216,284 @@ fn headset_is_wired(usb_devices: &Path) -> bool {
     })
 }
 
-/// Reads the battery of every Maxwell dongle plugged in.
-///
-/// A dongle that is present but cannot be opened or queried is still listed,
-/// with an unavailable battery: being detected is what keeps the desktop entry
-/// alive while the headset is parked.
-#[must_use]
-pub fn probe() -> Vec<Headset> {
-    let wired = headset_is_wired(Path::new(USB_DEVICES));
-    discover(Path::new("/sys/class/hidraw"))
-        .into_iter()
-        .map(|dongle| {
-            let battery = match read_battery(&dongle.node) {
-                Ok(Some(level)) => {
-                    report_recovery();
-                    if wired {
-                        BatteryState::Charging(Some(level))
-                    } else {
-                        BatteryState::Discharging(level)
-                    }
-                }
-                Ok(None) => {
-                    report_recovery();
-                    trace!("{}: the dongle did not answer", dongle.node.display());
-                    BatteryState::Unavailable
-                }
-                Err(err) => {
-                    report_error(&dongle.node, &err);
-                    BatteryState::Unavailable
-                }
-            };
-            Headset {
-                name: "Audeze Maxwell".to_owned(),
-                product: dongle.product,
-                vendor_id: VENDOR_ID,
-                product_id: dongle.product_id,
-                supports_battery: true,
-                battery,
-            }
+/// What the dongle last said about the headset's radio link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Link {
+    /// Nothing heard yet, either way.
+    Unknown,
+    /// The headset is linked.
+    Up,
+    /// The headset is gone: switched off, or out of range.
+    Down,
+}
+
+/// Something the dongle's report stream said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Message {
+    /// The headset's link came up or went down.
+    Link(bool),
+    /// The battery level, in percent.
+    Battery(u8),
+}
+
+/// One open dongle, and what is known about the headset behind it.
+#[derive(Debug)]
+struct Session {
+    file: File,
+    product: String,
+    product_id: u16,
+    link: Link,
+    level: Option<u8>,
+    opened_at: Instant,
+    /// When a battery request was last sent, and how many were in this session.
+    asked_at: Option<Instant>,
+    asks: u32,
+    /// Whether that request is still waiting for its answer.
+    pending: bool,
+    /// How many requests in a row went unanswered.
+    unanswered: u32,
+}
+
+impl Session {
+    /// Opens a dongle. `link` is what the previous session on this dongle knew:
+    /// the dongle re-enumerates a second or two after every link change, and
+    /// forgetting what it had just announced would turn an instant "the headset
+    /// is gone" back into a guess.
+    fn open(dongle: &Dongle, link: Link) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&dongle.node)?;
+        Ok(Self {
+            file,
+            product: dongle.product.clone(),
+            product_id: dongle.product_id,
+            link,
+            level: None,
+            opened_at: Instant::now(),
+            asked_at: None,
+            asks: 0,
+            pending: false,
+            unanswered: 0,
         })
-        .collect()
+    }
+
+    /// Fetches the report and takes in whatever it says.
+    fn listen(&mut self) -> io::Result<()> {
+        let frame = get_input_report(&self.file)?;
+        for message in messages(&frame) {
+            match message {
+                Message::Link(true) => {
+                    if self.link != Link::Up {
+                        debug!("the dongle reports the headset linked");
+                    }
+                    self.link = Link::Up;
+                    self.unanswered = 0;
+                }
+                Message::Link(false) => {
+                    if self.link != Link::Down {
+                        debug!("the dongle reports the headset gone");
+                    }
+                    self.link = Link::Down;
+                    self.level = None;
+                    self.pending = false;
+                    self.unanswered = 0;
+                }
+                Message::Battery(level) => {
+                    trace!("battery: {level}%");
+                    self.link = Link::Up;
+                    self.level = Some(level);
+                    self.pending = false;
+                    self.unanswered = 0;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a battery request is due. Never while the headset is known to be
+    /// gone, which is the whole point.
+    fn should_ask(&self, now: Instant, interval: Duration, listen_first: Duration) -> bool {
+        match self.link {
+            Link::Up => self
+                .asked_at
+                .is_none_or(|at| now.duration_since(at) >= interval),
+            // A few times per session at most, the first after having listened
+            // for a while. Requests sent to nobody are what this reader exists to
+            // avoid, so there is a hard ceiling rather than a slow retry.
+            Link::Unknown => match (self.asked_at, self.asks) {
+                (None, _) => now.duration_since(self.opened_at) >= listen_first,
+                (Some(at), asks) => usize::try_from(asks - 1)
+                    .ok()
+                    .and_then(|index| ASK_AGAIN_AFTER.get(index))
+                    .is_some_and(|delay| now.duration_since(at) >= *delay),
+            },
+            // The dongle said the headset is gone - possibly to the previous
+            // session, this belief being inherited. One question, in case the
+            // event announcing its return was lost with the re-enumeration.
+            Link::Down => {
+                self.asked_at.is_none() && now.duration_since(self.opened_at) >= listen_first
+            }
+        }
+    }
+
+    fn ask(&mut self, now: Instant) -> io::Result<()> {
+        if self.pending {
+            // Asking again with the previous request still open: it was lost.
+            self.unanswered += 1;
+        }
+        if self.link == Link::Up && self.unanswered >= MAX_UNANSWERED {
+            warn!(
+                "the headset is reported linked but left {MAX_UNANSWERED} battery requests \
+                 unanswered; not asking again until the dongle says something. If this \
+                 persists while the headset works, power-cycle the dongle"
+            );
+            self.link = Link::Unknown;
+            self.level = None;
+            self.pending = false;
+            self.unanswered = 0;
+            self.asked_at = Some(now);
+            return Ok(());
+        }
+
+        let mut request = [0u8; MSG_SIZE];
+        request[..BATTERY_REQUEST.len()].copy_from_slice(&BATTERY_REQUEST);
+        self.file.write_all(&request)?;
+        self.asked_at = Some(now);
+        self.asks += 1;
+        self.pending = true;
+        Ok(())
+    }
+
+    fn battery(&self, wired: bool) -> BatteryState {
+        match (self.link, self.level) {
+            (Link::Down, _) => BatteryState::Disconnected,
+            (_, Some(level)) if wired => BatteryState::Charging(Some(level)),
+            (_, Some(level)) => BatteryState::Discharging(level),
+            (_, None) => BatteryState::Unavailable,
+        }
+    }
+}
+
+/// A native reader that keeps its dongles open between polls.
+#[derive(Debug, Default)]
+pub struct Reader {
+    sessions: BTreeMap<PathBuf, Session>,
+    /// What the last session on each dongle (by product ID) knew of the link,
+    /// handed to the session that replaces it.
+    last_link: BTreeMap<u16, Link>,
+}
+
+impl Reader {
+    /// A reader with no dongle open yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Listens to every Maxwell dongle plugged in, asking for the level only
+    /// when it is due (every `interval` while the headset is linked).
+    ///
+    /// Meant to be called about once a second. A dongle that is present but
+    /// cannot be opened is still listed, with an unavailable battery.
+    pub fn poll(&mut self, interval: Duration) -> Vec<Headset> {
+        self.poll_with(interval, LISTEN_FIRST)
+    }
+
+    fn poll_with(&mut self, interval: Duration, listen_first: Duration) -> Vec<Headset> {
+        let wired = headset_is_wired(Path::new(USB_DEVICES));
+        let dongles = discover(Path::new(HIDRAW_CLASS));
+        let now = Instant::now();
+
+        // A node that is gone takes its session with it: the dongle
+        // re-enumerates after every link change.
+        let last_link = &mut self.last_link;
+        self.sessions.retain(|node, session| {
+            let present = dongles.iter().any(|dongle| &dongle.node == node);
+            if !present {
+                last_link.insert(session.product_id, session.link);
+            }
+            present
+        });
+
+        dongles
+            .iter()
+            .map(|dongle| {
+                let battery = match self.listen_to(dongle, now, interval, listen_first, wired) {
+                    Ok(battery) => {
+                        report_recovery();
+                        battery
+                    }
+                    Err(err) => {
+                        // Most often the node vanishing mid-exchange, or not
+                        // having its permissions yet right after coming back.
+                        if let Some(session) = self.sessions.remove(&dongle.node) {
+                            self.last_link.insert(session.product_id, session.link);
+                        }
+                        report_error(&dongle.node, &err);
+                        BatteryState::Unavailable
+                    }
+                };
+                Headset {
+                    name: "Audeze Maxwell".to_owned(),
+                    product: dongle.product.clone(),
+                    vendor_id: VENDOR_ID,
+                    product_id: dongle.product_id,
+                    supports_battery: true,
+                    battery,
+                }
+            })
+            .collect()
+    }
+
+    /// A one-shot reading, for the `status` command: open, ask once, and give
+    /// the answer time to arrive. Usually there within 60 ms, it can take a few
+    /// hundred right after the dongle re-enumerated.
+    pub fn read_once(&mut self) -> Vec<Headset> {
+        let mut headsets = self.poll_with(Duration::ZERO, Duration::ZERO);
+        for _ in 0..ANSWER_POLLS {
+            if headsets
+                .iter()
+                .all(|headset| headset.battery != BatteryState::Unavailable)
+            {
+                break;
+            }
+            sleep(ANSWER_DELAY);
+            // `Duration::MAX`: listen only, the one request is already out.
+            headsets = self.poll_with(Duration::MAX, Duration::ZERO);
+        }
+        headsets
+    }
+
+    fn listen_to(
+        &mut self,
+        dongle: &Dongle,
+        now: Instant,
+        interval: Duration,
+        listen_first: Duration,
+        wired: bool,
+    ) -> io::Result<BatteryState> {
+        if !self.sessions.contains_key(&dongle.node) {
+            let link = self
+                .last_link
+                .get(&dongle.product_id)
+                .copied()
+                .unwrap_or(Link::Unknown);
+            let session = Session::open(dongle, link)?;
+            debug!("opened {} ({})", dongle.node.display(), session.product);
+            self.sessions.insert(dongle.node.clone(), session);
+        }
+        let session = self
+            .sessions
+            .get_mut(&dongle.node)
+            .expect("the session was just inserted");
+
+        session.listen()?;
+        if session.should_ask(now, interval, listen_first) {
+            session.ask(now)?;
+        }
+        Ok(session.battery(wired))
+    }
 }
 
 /// A Maxwell dongle found in sysfs.
@@ -268,28 +550,6 @@ fn parse_uevent(uevent: &str) -> Option<(u16, u16, u16, String)> {
     ))
 }
 
-/// Asks one dongle for the battery level.
-///
-/// Returns `Ok(None)` when the dongle is reachable but has no answer, which is
-/// what happens when the headset is off or its radio is parked.
-fn read_battery(node: &Path) -> io::Result<Option<u8>> {
-    let mut device = OpenOptions::new().read(true).write(true).open(node)?;
-
-    let mut request = [0u8; MSG_SIZE];
-    request[..BATTERY_REQUEST.len()].copy_from_slice(&BATTERY_REQUEST);
-    device.write_all(&request)?;
-
-    for attempt in 1..=READ_ATTEMPTS {
-        sleep(READ_DELAY);
-        let frame = get_input_report(&device)?;
-        if let Some(level) = parse_battery(&frame) {
-            trace!("battery answer on read {attempt}: {level}%");
-            return Ok(Some(level));
-        }
-    }
-    Ok(None)
-}
-
 /// The part of an input report written since it was last fetched.
 fn fresh(frame: &[u8]) -> &[u8] {
     let len = frame.get(FRESH_LEN_OFFSET).copied().map_or(0, usize::from);
@@ -297,19 +557,29 @@ fn fresh(frame: &[u8]) -> &[u8] {
     frame.get(PAYLOAD_OFFSET..end).unwrap_or_default()
 }
 
-/// Finds the most recent battery answer in the fresh part of an input report
-/// and range-checks the level.
+/// Everything the fresh part of an input report says, oldest first.
 ///
-/// The fresh part is a stream, oldest message first, and it holds several
-/// answers when requests were sent faster than the report was fetched - so the
-/// one that counts is the last. A message cut off by the end of the buffer is
-/// skipped: there is no telling what its level byte was.
-fn parse_battery(frame: &[u8]) -> Option<u8> {
-    fresh(frame)
-        .windows(BATTERY_ANSWER.len() + 1)
-        .filter(|window| window.starts_with(&BATTERY_ANSWER))
-        .map(|window| window[BATTERY_ANSWER.len()])
-        .rfind(|level| *level <= 100)
+/// Matching on the full message headers, rather than on the command bytes
+/// alone, is what keeps an acknowledgement (which echoes `d6 0c` too) from
+/// being read as a level. A message cut off by the end of the buffer is
+/// skipped, and so is a level above 100.
+fn messages(frame: &[u8]) -> Vec<Message> {
+    let data = fresh(frame);
+    (0..data.len())
+        .filter_map(|at| {
+            let rest = &data[at..];
+            if let Some(value) = rest
+                .strip_prefix(&BATTERY_ANSWER[..])
+                .and_then(<[u8]>::first)
+            {
+                (*value <= 100).then_some(Message::Battery(*value))
+            } else {
+                rest.strip_prefix(&LINK_EVENT[..])
+                    .and_then(<[u8]>::first)
+                    .map(|state| Message::Link(*state != 0))
+            }
+        })
+        .collect()
 }
 
 /// `HIDIOCGINPUT`: fetches the current value of an input report.
@@ -366,49 +636,52 @@ mod tests {
         0xd6, 0x0c,
     ];
 
-    /// A frame holding `message` as its only fresh content.
-    fn frame_with(message: &[u8]) -> [u8; MSG_SIZE] {
+    /// A frame holding `stream` as its only fresh content.
+    fn frame_with(stream: &[u8]) -> [u8; MSG_SIZE] {
         let mut frame = [0u8; MSG_SIZE];
         frame[0] = REPLY_REPORT_ID;
-        frame[FRESH_LEN_OFFSET] = u8::try_from(message.len()).unwrap();
-        frame[PAYLOAD_OFFSET..PAYLOAD_OFFSET + message.len()].copy_from_slice(message);
+        frame[FRESH_LEN_OFFSET] = u8::try_from(stream.len()).unwrap();
+        frame[PAYLOAD_OFFSET..PAYLOAD_OFFSET + stream.len()].copy_from_slice(stream);
         frame
     }
 
-    #[test]
-    fn reads_the_level_out_of_a_real_frame() {
-        assert_eq!(parse_battery(&FRESH_FRAME), Some(92));
+    fn hex(text: &str) -> Vec<u8> {
+        text.split_whitespace()
+            .map(|byte| u8::from_str_radix(byte, 16).unwrap())
+            .collect()
     }
 
-    #[test]
-    fn the_newest_of_several_answers_wins() {
-        // Captured while the headset was coming up: the buffer is full (59 fresh
-        // bytes), starts in the middle of a message, and holds one answer at 99%
-        // followed by newer ones at 100%.
-        let mut frame = [0u8; MSG_SIZE];
-        frame[0] = REPLY_REPORT_ID;
-        frame[FRESH_LEN_OFFSET] = 59;
-        frame[2] = 0x80;
-        let ack = [0x05, 0x5b, 0x03, 0x00, 0xd6, 0x0c, 0x00];
-        let answer = |level: u8| [0x05, 0x5d, 0x05, 0x00, 0xd6, 0x0c, 0x00, 0x00, level];
-        let stream: Vec<u8> = [0x00, 0xd6, 0x0c, 0x00] // tail of a cut-off message
-            .into_iter()
-            .chain(answer(99))
-            .chain(ack)
-            .chain(answer(100))
-            .chain(ack)
-            .chain(answer(100))
-            .collect();
-        frame[PAYLOAD_OFFSET..PAYLOAD_OFFSET + stream.len()].copy_from_slice(&stream);
+    /// What the dongle said, unprompted, when the headset was switched off.
+    const POWER_OFF: &str =
+        "05 5d 0e 00 b1 2c 00 02 00 01 8d 90 9b 67 89 c2 ff 00 05 5c 03 00 80 2c 01";
 
-        assert_eq!(parse_battery(&frame), Some(100));
+    /// And when it was switched back on: the link event, then the level.
+    const POWER_ON: &str = "05 5c 03 00 80 2c 01 05 5d 0e 00 b1 2c 00 02 01 01 8d 90 9b 67 89 \
+                            c2 80 01 05 5c 03 00 80 2c 03 05 5b 03 00 d6 0c 00 05 5d 05 00 d6 \
+                            0c 00 00 63";
+
+    #[test]
+    fn reads_the_level_out_of_a_real_frame() {
+        assert_eq!(messages(&FRESH_FRAME), [Message::Battery(92)]);
     }
 
     #[test]
     fn leftovers_from_earlier_exchanges_are_not_an_answer() {
         // Without the fresh-byte count this frame reads 92% for ever, which is
-        // what a switched-off headset would look like.
-        assert_eq!(parse_battery(&STALE_FRAME), None);
+        // what HeadsetControl shows for a headset that is switched off.
+        assert_eq!(messages(&STALE_FRAME), []);
+    }
+
+    #[test]
+    fn the_dongle_announces_the_headset_going_and_coming() {
+        assert_eq!(
+            messages(&frame_with(&hex(POWER_OFF))),
+            [Message::Link(false)]
+        );
+        assert_eq!(
+            messages(&frame_with(&hex(POWER_ON))),
+            [Message::Link(true), Message::Battery(99)]
+        );
     }
 
     #[test]
@@ -416,48 +689,150 @@ mod tests {
         // The acknowledgement (type 5b) echoes `d6 0c` too. Followed by
         // padding it reads `d6 0c 00 00 00`, which a looser match turns into a
         // bogus 0% - the glitch HeadsetControl produces.
-        let frame = frame_with(&[0x05, 0x5b, 0x03, 0x00, 0xd6, 0x0c, 0x00, 0x00, 0x00, 0x00]);
-        assert_eq!(parse_battery(&frame), None);
+        let frame = frame_with(&hex("05 5b 03 00 d6 0c 00 00 00 00"));
+        assert_eq!(messages(&frame), []);
     }
 
     #[test]
-    fn an_empty_frame_means_no_answer() {
-        assert_eq!(parse_battery(&[0u8; MSG_SIZE]), None);
-        assert_eq!(parse_battery(&[]), None);
-        assert_eq!(parse_battery(&[REPLY_REPORT_ID]), None);
-    }
-
-    #[test]
-    fn a_level_above_one_hundred_is_rejected() {
-        let mut message = [0u8; 9];
-        message[0] = 0x05;
-        message[1..8].copy_from_slice(&BATTERY_ANSWER);
-        message[8] = 0xff;
-        assert_eq!(parse_battery(&frame_with(&message)), None);
-        message[8] = 100;
-        assert_eq!(parse_battery(&frame_with(&message)), Some(100));
-    }
-
-    #[test]
-    fn an_answer_cut_off_by_the_fresh_count_is_ignored() {
-        // The header is there but the count stops short of the level byte.
-        let mut message = [0u8; 9];
-        message[0] = 0x05;
-        message[1..8].copy_from_slice(&BATTERY_ANSWER);
-        message[8] = 50;
-        let mut frame = frame_with(&message);
-        frame[FRESH_LEN_OFFSET] -= 1;
-        assert_eq!(parse_battery(&frame), None);
+    fn nonsense_is_ignored() {
+        assert_eq!(messages(&[0u8; MSG_SIZE]), []);
+        assert_eq!(messages(&[]), []);
+        assert_eq!(messages(&[REPLY_REPORT_ID]), []);
+        // A level above 100.
+        assert_eq!(
+            messages(&frame_with(&hex("05 5d 05 00 d6 0c 00 00 ff"))),
+            []
+        );
+        assert_eq!(
+            messages(&frame_with(&hex("05 5d 05 00 d6 0c 00 00 64"))),
+            [Message::Battery(100)]
+        );
+        // An answer cut off before its level byte.
+        assert_eq!(messages(&frame_with(&hex("05 5d 05 00 d6 0c 00 00"))), []);
     }
 
     #[test]
     fn a_fresh_count_larger_than_the_frame_does_not_panic() {
         let mut frame = FRESH_FRAME;
         frame[FRESH_LEN_OFFSET] = 0xff;
-        // The count is clamped to the buffer. Everything then counts as fresh,
-        // so the last answer in the buffer wins: the 91% that was a leftover
-        // while the count still said sixteen.
-        assert_eq!(parse_battery(&frame), Some(91));
+        // Clamped to the buffer: everything then counts, leftovers included.
+        assert_eq!(messages(&frame).last(), Some(&Message::Battery(91)));
+    }
+
+    fn session(link: Link, level: Option<u8>, asked: Option<Instant>) -> Session {
+        Session {
+            file: File::open("/dev/null").unwrap(),
+            product: "test".to_owned(),
+            product_id: 0x4b18,
+            link,
+            level,
+            opened_at: Instant::now(),
+            asked_at: asked,
+            asks: u32::from(asked.is_some()),
+            pending: false,
+            unanswered: 0,
+        }
+    }
+
+    #[test]
+    fn a_headset_that_is_gone_is_asked_once_at_most() {
+        // The rule that keeps the dongle alive: once a session has asked, no
+        // other request goes out while the headset is known to be off, however
+        // long that lasts and however short the interval.
+        let long_ago = Instant::now().checked_sub(Duration::from_secs(86_400));
+        let now = Instant::now();
+        let minute = Duration::from_secs(60);
+
+        assert!(!session(Link::Down, None, long_ago).should_ask(now, minute, Duration::ZERO));
+        assert!(!session(Link::Down, None, long_ago).should_ask(
+            now,
+            Duration::ZERO,
+            Duration::ZERO
+        ));
+        // The one question a session is allowed waits until it has listened.
+        assert!(!session(Link::Down, None, None).should_ask(now, minute, LISTEN_FIRST));
+        assert!(session(Link::Down, None, None).should_ask(now, minute, Duration::ZERO));
+    }
+
+    #[test]
+    fn a_linked_headset_is_asked_once_per_interval() {
+        let now = Instant::now();
+        let minute = Duration::from_secs(60);
+        let asked = |seconds| now.checked_sub(Duration::from_secs(seconds));
+
+        assert!(session(Link::Up, Some(90), None).should_ask(now, minute, Duration::ZERO));
+        assert!(!session(Link::Up, Some(90), asked(30)).should_ask(now, minute, Duration::ZERO));
+        assert!(session(Link::Up, Some(90), asked(61)).should_ask(now, minute, Duration::ZERO));
+    }
+
+    #[test]
+    fn a_silent_dongle_is_asked_a_few_times_and_never_again() {
+        let now = Instant::now();
+        let minute = Duration::from_secs(60);
+        let ago = |seconds| now.checked_sub(Duration::from_secs(seconds));
+
+        // The first question waits until the session has listened...
+        assert!(!session(Link::Unknown, None, None).should_ask(now, minute, LISTEN_FIRST));
+        assert!(session(Link::Unknown, None, None).should_ask(now, minute, Duration::ZERO));
+
+        // ...a lost request is made up for, since one does get lost at times...
+        let mut asked_once = session(Link::Unknown, None, ago(5));
+        assert!(!asked_once.should_ask(now, minute, Duration::ZERO));
+        asked_once.asked_at = ago(11);
+        assert!(asked_once.should_ask(now, minute, Duration::ZERO));
+
+        let mut asked_twice = session(Link::Unknown, None, ago(31));
+        asked_twice.asks = 2;
+        assert!(asked_twice.should_ask(now, minute, Duration::ZERO));
+
+        // ...and then it stops, however long the silence lasts: a request every
+        // ten seconds to a headset that was off is what wedged the dongle.
+        let mut asked_out = session(Link::Unknown, None, ago(86_400));
+        asked_out.asks = 3;
+        assert!(!asked_out.should_ask(now, minute, Duration::ZERO));
+        assert!(!asked_out.should_ask(now, Duration::ZERO, Duration::ZERO));
+    }
+
+    #[test]
+    fn a_linked_headset_that_stops_answering_is_left_alone() {
+        // Second line of defence: requests must not pile up behind a headset
+        // that is announced but mute. /dev/null swallows the writes.
+        let mut session = session(Link::Up, Some(90), None);
+        session.file = OpenOptions::new().write(true).open("/dev/null").unwrap();
+        let now = Instant::now();
+
+        for _ in 0..=MAX_UNANSWERED {
+            assert_eq!(session.link, Link::Up);
+            session.ask(now).unwrap();
+        }
+        // It gave up: no more asking until the dongle speaks again.
+        assert_eq!(session.link, Link::Unknown);
+        assert!(!session.pending);
+        assert!(!session.should_ask(now, Duration::from_secs(60), Duration::ZERO));
+    }
+
+    #[test]
+    fn the_battery_state_follows_the_link() {
+        assert_eq!(
+            session(Link::Down, Some(80), None).battery(false),
+            BatteryState::Disconnected
+        );
+        assert_eq!(
+            session(Link::Up, Some(80), None).battery(false),
+            BatteryState::Discharging(80)
+        );
+        assert_eq!(
+            session(Link::Up, Some(80), None).battery(true),
+            BatteryState::Charging(Some(80))
+        );
+        assert_eq!(
+            session(Link::Up, None, None).battery(false),
+            BatteryState::Unavailable
+        );
+        assert_eq!(
+            session(Link::Unknown, None, None).battery(false),
+            BatteryState::Unavailable
+        );
     }
 
     #[test]

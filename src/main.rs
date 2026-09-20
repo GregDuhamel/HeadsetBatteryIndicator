@@ -112,8 +112,8 @@ struct RunArgs {
     #[arg(short, long, value_name = "SECONDS", default_value_t = DEFAULT_INTERVAL_SECS)]
     interval: u64,
 
-    /// Delay between two readings with the native reader, which is cheap enough
-    /// to notice within seconds that the headset was switched off, in seconds.
+    /// How often the native reader asks a linked headset for its level, in
+    /// seconds. It never asks a headset that is switched off.
     #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_NATIVE_INTERVAL_SECS)]
     native_interval: u64,
 
@@ -147,7 +147,15 @@ fn main() -> ExitCode {
         cli.common.headsetcontrol.clone(),
         Duration::from_secs(cli.common.timeout.max(1)),
     );
-    let source = Source::new(cli.common.backend.into(), control);
+    let native_interval = match &cli.command {
+        Some(Command::Run(args)) => args.native_interval,
+        _ => cli.run.native_interval,
+    };
+    let source = Source::new(
+        cli.common.backend.into(),
+        control,
+        Duration::from_secs(native_interval.max(1)),
+    );
 
     let result = match cli.command.unwrap_or(Command::Run(cli.run)) {
         Command::Run(args) => run(&args, source),
@@ -204,7 +212,7 @@ fn run(args: &RunArgs, source: Source) -> Result<()> {
 }
 
 fn status(source: &Source) -> Result<()> {
-    let headsets = source.probe()?;
+    let headsets = source.probe_once()?;
     let mut out = std::io::stdout().lock();
 
     if headsets.is_empty() {
@@ -221,6 +229,7 @@ fn status(source: &Source) -> Result<()> {
                 "unavailable (headset off?)".to_owned()
             }
             BatteryState::Unavailable => "not supported by this headset".to_owned(),
+            BatteryState::Disconnected => "headset switched off (the dongle says so)".to_owned(),
         };
         let published = find_power_supply(&headset.uniq()).map_or_else(
             || "not published (is the daemon running?)".to_owned(),
@@ -236,7 +245,7 @@ fn status(source: &Source) -> Result<()> {
 }
 
 fn udev_rules(args: &UdevRulesArgs, source: &Source) -> Result<()> {
-    let headsets = source.probe()?;
+    let headsets = source.probe_once()?;
     let mut out = std::io::stdout().lock();
 
     writeln!(

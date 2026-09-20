@@ -16,7 +16,24 @@ use uhid_battery::{Battery, DEV_UHID, Handle, Identity, Kind};
 /// Default for [`Config::interval`], in seconds.
 pub const DEFAULT_INTERVAL_SECS: u64 = 60;
 /// Default for [`Config::native_interval`], in seconds.
-pub const DEFAULT_NATIVE_INTERVAL_SECS: u64 = 10;
+pub const DEFAULT_NATIVE_INTERVAL_SECS: u64 = 60;
+
+/// How often the native reader is run. It only listens to the dongle - nothing
+/// goes over the air - and that is how it learns within a second that the
+/// headset came or went.
+const NATIVE_TICK: Duration = Duration::from_secs(1);
+
+/// How long the dongle has to keep saying the headset is gone before it is
+/// believed. The link drops for a second while a freshly powered headset
+/// settles, and the entry should not blink out and back for that.
+const DISCONNECT_SETTLE: Duration = Duration::from_secs(3);
+
+/// How long a new overall state has to last before it is worth a log line.
+const SUMMARY_SETTLE: Duration = Duration::from_secs(5);
+
+/// An unchanged level is pushed again this often, as a safety net for a push
+/// the kernel dropped while it was probing the device.
+const REPUBLISH_EVERY: Duration = Duration::from_secs(60);
 /// Default for [`Config::offline_grace`], in seconds.
 pub const DEFAULT_OFFLINE_GRACE_SECS: u64 = 10;
 /// Default for [`Config::missing_grace`], in seconds.
@@ -81,7 +98,12 @@ impl Summary {
             Self::NoDevice
         } else if with_battery.peek().is_none() {
             Self::NoBattery
-        } else if with_battery.all(|h| h.battery == BatteryState::Unavailable) {
+        } else if with_battery.all(|h| {
+            matches!(
+                h.battery,
+                BatteryState::Unavailable | BatteryState::Disconnected
+            )
+        }) {
             Self::Offline
         } else {
             Self::Online
@@ -96,15 +118,21 @@ impl Summary {
 /// off rather than a minute later; otherwise the cadence is whatever the reader
 /// that answered can afford.
 fn next_delay(unanswered: bool, native: bool, config: &Config) -> Duration {
-    let regular = if native {
-        config.native_interval.min(config.interval)
-    } else {
-        config.interval
-    };
+    let regular = if native { NATIVE_TICK } else { config.interval };
     if unanswered {
         UNANSWERED_RETRY.min(regular)
     } else {
         regular
+    }
+}
+
+/// Starts, keeps or clears the clock of a condition that is `fine` or not on
+/// this poll. The clock starts on the first poll that is not fine.
+fn note(since: &mut Option<Instant>, fine: bool, now: Instant) {
+    if fine {
+        *since = None;
+    } else {
+        since.get_or_insert(now);
     }
 }
 
@@ -162,9 +190,9 @@ pub struct Config {
     /// Delay between two readings through HeadsetControl, which is expensive:
     /// twenty packets and close to three seconds each.
     pub interval: Duration,
-    /// Delay between two readings when the native reader answers. One request,
-    /// 70 ms: cheap enough to notice within seconds that the headset was
-    /// switched off, or on again.
+    /// How often the native reader asks a linked headset for its level. It
+    /// learns about the headset coming and going by listening, every second,
+    /// and never asks a headset that is gone; see [`crate::maxwell`].
     pub native_interval: Duration,
     /// How long a headset that is still detected, but no longer answering
     /// battery queries, keeps its entry: long enough for a few retries, so one
@@ -207,10 +235,22 @@ struct VirtualBattery {
     last_reading: Instant,
     /// When the headset was last reported at all, answering or not.
     last_seen: Instant,
+    /// Since when the headset has been silent, if it is: the poll on which it
+    /// first failed to answer. The grace runs from there and not from the last
+    /// answer - which is a whole polling interval older, so that with a grace
+    /// no longer than the interval the first lost reading would already have
+    /// outlived it, and the retries would never get their chance.
+    silent_since: Option<Instant>,
+    /// Since when the headset has been missing from the polls, likewise.
+    missing_since: Option<Instant>,
+    /// Since when the reader has been saying the headset is gone.
+    gone_since: Option<Instant>,
     /// A reading that was too far off to publish, waiting for confirmation.
     deferred: Option<u8>,
     /// The level the last INFO line mentioned.
     logged_percent: u8,
+    /// When a reading was last pushed to the kernel.
+    published_at: Instant,
 }
 
 impl VirtualBattery {
@@ -284,6 +324,8 @@ pub struct Bridge {
     batteries: Vec<VirtualBattery>,
     probe_failing: bool,
     last_summary: Option<Summary>,
+    /// A summary that differs from the announced one, and since when.
+    unsettled: Option<(Summary, Instant)>,
 }
 
 impl Bridge {
@@ -298,6 +340,7 @@ impl Bridge {
             batteries: Vec::new(),
             probe_failing: false,
             last_summary: None,
+            unsettled: None,
         }
     }
 
@@ -309,8 +352,10 @@ impl Bridge {
     /// failing reader is logged and retried on the next tick.
     pub fn run(&mut self, stop: &AtomicBool) -> Result<()> {
         info!(
-            "reading batteries with {} (every {:?} natively, {:?} otherwise)",
+            "reading batteries with {} (natively: listening every {:?}, asking every {:?}; \
+             otherwise every {:?})",
             self.source.describe(),
+            NATIVE_TICK,
             self.config.native_interval,
             self.config.interval
         );
@@ -374,17 +419,42 @@ impl Bridge {
             }
         }
 
+        for battery in &mut self.batteries {
+            note(&mut battery.silent_since, battery.last_reading == now, now);
+            note(&mut battery.missing_since, battery.last_seen == now, now);
+        }
         self.expire(now);
         self.batteries
             .iter()
-            .any(|battery| battery.last_reading != now)
+            .any(|battery| battery.silent_since.is_some())
     }
 
     /// Says what the poll found, but only when that changed since last time.
     fn announce(&mut self, summary: Summary, headsets: &[Headset]) {
         if self.last_summary == Some(summary) {
+            self.unsettled = None;
             return;
         }
+        // Say nothing about a state that may not last: the dongle drops off the
+        // bus for a couple of seconds whenever the headset comes or goes, and
+        // "check that the dongle is plugged in" is not what that calls for.
+        // That goes for the first summary too: the reader listens for a few
+        // seconds before asking anything, and "not answering" is not news then.
+        let now = Instant::now();
+        {
+            match self.unsettled {
+                Some((pending, since)) if pending == summary => {
+                    if now.duration_since(since) < SUMMARY_SETTLE {
+                        return;
+                    }
+                }
+                _ => {
+                    self.unsettled = Some((summary, now));
+                    return;
+                }
+            }
+        }
+        self.unsettled = None;
         self.last_summary = Some(summary);
 
         let names = || {
@@ -403,8 +473,7 @@ impl Bridge {
             ),
             Summary::NoBattery => info!("{} found, but none reports a battery", names()),
             Summary::Offline => info!(
-                "{} is detected but not answering battery queries (switched off?); keeping its \
-                 entry for a few more polls",
+                "{} is detected but not answering battery queries (switched off?)",
                 names()
             ),
             // Nothing to say: the level lines speak for themselves.
@@ -443,6 +512,18 @@ impl Bridge {
                 trace!("{} is offline", headset.name);
                 return Ok(());
             }
+            // The reader was told the headset is gone: no grace to sit out.
+            BatteryState::Disconnected => {
+                if let Some(index) = existing {
+                    let since = *self.batteries[index].gone_since.get_or_insert(now);
+                    if now.duration_since(since) >= DISCONNECT_SETTLE {
+                        let battery = self.batteries.remove(index);
+                        info!("{} was switched off, removing its battery", battery.name);
+                        self.pool.release(battery.device);
+                    }
+                }
+                return Ok(());
+            }
         };
 
         let Some(index) = existing else {
@@ -453,6 +534,7 @@ impl Bridge {
         // The headset answered, so it is alive even if we end up distrusting
         // the level it gave us.
         battery.last_reading = now;
+        battery.gone_since = None;
 
         let (known_percent, known_charging) = (battery.device.percent(), battery.device.charging());
         if vet(known_percent, percent, battery.deferred) == Verdict::Defer {
@@ -465,11 +547,14 @@ impl Bridge {
         }
         battery.deferred = None;
 
-        // An unchanged level is pushed all the same. The kernel drops input
+        // An unchanged level is still pushed now and then. The kernel drops input
         // reports without telling anyone while it is probing the device, so
-        // this periodic push is what guarantees a lost one is made up for; it
-        // rate-limits the resulting uevents itself.
-        if known_percent != percent || known_charging != charging {
+        // this is what guarantees a lost push is made up for.
+        let changed = known_percent != percent || known_charging != charging;
+        if !changed && now.duration_since(battery.published_at) < REPUBLISH_EVERY {
+            return Ok(());
+        }
+        if changed {
             let suffix = if charging { ", charging" } else { "" };
             if known_charging != charging || battery.logged_percent.abs_diff(percent) >= LOG_STEP {
                 battery.logged_percent = percent;
@@ -478,6 +563,7 @@ impl Bridge {
                 debug!("{}: {percent}%{suffix}", battery.name);
             }
         }
+        battery.published_at = now;
         battery.publish(percent, charging)
     }
 
@@ -539,8 +625,12 @@ impl Bridge {
             device,
             last_reading: now,
             last_seen: now,
+            silent_since: None,
+            missing_since: None,
+            gone_since: None,
             deferred: None,
             logged_percent: percent,
+            published_at: now,
         });
         Ok(())
     }
@@ -550,9 +640,12 @@ impl Bridge {
         let mut index = 0;
         while index < self.batteries.len() {
             let battery = &self.batteries[index];
+            let since = |start: Option<Instant>| {
+                start.map_or(Duration::ZERO, |start| now.duration_since(start))
+            };
             let verdict = withdrawal(
-                now.duration_since(battery.last_reading),
-                now.duration_since(battery.last_seen),
+                since(battery.silent_since),
+                since(battery.missing_since),
                 &self.config,
             );
 
@@ -714,32 +807,71 @@ mod tests {
     }
 
     #[test]
+    fn the_grace_runs_from_the_first_lost_reading() {
+        // The bug this guards against: the grace (10 s) is shorter than the
+        // polling interval. Counted from the last answer, the very first lost
+        // reading had already outlived it, and the battery was withdrawn on a
+        // single miss without one retry.
+        let config = Config::default();
+
+        let start = Instant::now();
+        let mut silent_since = None;
+        let silence =
+            |since: Option<Instant>, now: Instant| since.map_or(Duration::ZERO, |s| now - s);
+
+        // Answered at `start`; a whole interval later the first poll goes
+        // unanswered. Counted from `start`, the grace would already be over.
+        let first_miss = start + config.interval;
+        assert!(config.interval > config.offline_grace);
+        note(&mut silent_since, false, first_miss);
+        assert_eq!(
+            withdrawal(silence(silent_since, first_miss), Duration::ZERO, &config),
+            Withdrawal::Keep
+        );
+
+        // The retries get their chance...
+        for retry in 1..=3 {
+            let now = first_miss + UNANSWERED_RETRY * retry;
+            note(&mut silent_since, false, now);
+            assert_eq!(
+                withdrawal(silence(silent_since, now), Duration::ZERO, &config),
+                Withdrawal::Keep,
+                "retry {retry}"
+            );
+        }
+        // ...and only then is the headset given up on.
+        let now = first_miss + UNANSWERED_RETRY * 4;
+        note(&mut silent_since, false, now);
+        assert_eq!(
+            withdrawal(silence(silent_since, now), Duration::ZERO, &config),
+            Withdrawal::Silent
+        );
+
+        // One answer in between resets the clock.
+        note(&mut silent_since, true, now);
+        assert_eq!(silent_since, None);
+    }
+
+    #[test]
     fn the_cadence_follows_what_the_reader_can_afford() {
         let config = Config::default();
         // The native reader is cheap: look often, to notice a power-off quickly.
-        assert_eq!(next_delay(false, true, &config), Duration::from_secs(10));
+        assert_eq!(next_delay(false, true, &config), NATIVE_TICK);
         // HeadsetControl is not.
         assert_eq!(next_delay(false, false, &config), Duration::from_secs(60));
-        // A battery that just went quiet is asked again at once, either way.
-        assert_eq!(next_delay(true, true, &config), UNANSWERED_RETRY);
+        // A battery that just went quiet is looked at again shortly. The native
+        // reader is already faster than that.
+        assert_eq!(next_delay(true, true, &config), NATIVE_TICK);
         assert_eq!(next_delay(true, false, &config), UNANSWERED_RETRY);
 
         // Several retries fit in the grace, so one lost reading never flaps it.
         assert!(config.offline_grace >= UNANSWERED_RETRY * 3);
-
-        // A user asking for a slow cadence gets it for both readers.
-        let lazy = Config {
-            interval: Duration::from_secs(5),
-            ..Config::default()
-        };
-        assert_eq!(next_delay(false, true, &lazy), Duration::from_secs(5));
     }
 
     #[test]
     fn default_config_is_conservative() {
         let config = Config::default();
         assert_eq!(config.interval, Duration::from_secs(60));
-        assert!(config.native_interval < config.interval);
         assert!(config.missing_grace > config.offline_grace);
         assert_eq!(config.uhid_path, PathBuf::from("/dev/uhid"));
     }

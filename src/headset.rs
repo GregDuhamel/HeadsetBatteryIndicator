@@ -7,8 +7,11 @@ pub enum BatteryState {
     Discharging(u8),
     /// Plugged in. Some headsets stop reporting a level while charging.
     Charging(Option<u8>),
-    /// Powered off, out of range, or the query failed.
+    /// No level could be read: the query failed, or nothing is known yet.
     Unavailable,
+    /// Positively known to be switched off or out of range, as opposed to merely
+    /// not answering: the reader was told so. There is nothing to wait for.
+    Disconnected,
 }
 
 /// One headset, as reported by HeadsetControl.
