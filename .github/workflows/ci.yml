@@ -24,7 +24,7 @@ jobs:
         # The second entry is the MSRV declared in Cargo.toml.
         rust: [stable, "1.85"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust ${{ matrix.rust }}
         uses: dtolnay/rust-toolchain@master
@@ -48,7 +48,7 @@ jobs:
     name: Packaging
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
