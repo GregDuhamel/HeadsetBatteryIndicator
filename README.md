@@ -250,6 +250,14 @@ CI runs the test suite on stable and on the MSRV, verifies the systemd unit with
 `systemd-analyze`, and the lint workflow covers rustfmt, clippy, rustdoc,
 shellcheck and `cargo audit`.
 
+## Releasing
+
+`main` only takes signed commits that went through a pull request, so the
+release workflow does not write to it. Bump `version` in `Cargo.toml` (and
+`Cargo.lock`) in a pull request; once merged, run *Actions → Release*. It tests,
+builds, tags `v<version>` and publishes the GitHub release with the binary
+attached - and refuses to run if that tag already exists.
+
 ## Troubleshooting
 
 **Nothing shows up in the applet.** Check that the kernel created the power
