@@ -225,10 +225,13 @@ nobody is granted access to the node:
 * the only other device it reaches is the headset's own `hidraw` node, through
   the `headset-battery` group set by the generated udev rule.
 
-The crate itself denies `unsafe` code outside three documented spots: adopting
-the descriptor systemd passes, clearing the `LISTEN_*` environment variables,
-and the `HIDIOCGINPUT` ioctl of the native reader. Those descriptors also get `FD_CLOEXEC`, so the `headsetcontrol`
-child never inherits `/dev/uhid`.
+The daemon denies `unsafe` code outside one documented spot, the `HIDIOCGINPUT`
+ioctl of the native reader. Everything to do with `/dev/uhid` - the wire format,
+adopting the descriptor systemd passes, checking that it really is the uhid
+device before writing into it, marking it close-on-exec so the `headsetcontrol`
+child never inherits it - lives in
+[uhid-battery](https://github.com/GregDuhamel/uhid-battery), shared with
+[razerd](https://github.com/GregDuhamel/razerd).
 
 ## Development
 
@@ -239,14 +242,9 @@ cargo fmt --all --check
 ```
 
 The CLI tests drive the binary against a stub `headsetcontrol`, so they run
-anywhere. One acceptance test does talk to the real `/dev/uhid` — it creates a
-virtual battery and reads it back from sysfs — and is ignored unless you run it
-as root:
-
-```sh
-cargo build --tests
-sudo -E cargo test --test uhid_live -- --ignored --nocapture
-```
+anywhere. What talks to the real kernel - creating a virtual battery and reading
+it back from sysfs - is tested in
+[uhid-battery](https://github.com/GregDuhamel/uhid-battery), as root.
 
 CI runs the test suite on stable and on the MSRV, verifies the systemd unit with
 `systemd-analyze`, and the lint workflow covers rustfmt, clippy, rustdoc,

@@ -9,11 +9,15 @@
 //! `power_supply` object itself, UPower picks it up like any other peripheral
 //! battery, and KDE's Power & Battery applet lists the headset.
 //!
+//! That half of the job is the [uhid-battery] crate's, shared with razerd. This
+//! crate is the other half: knowing the level.
+//!
 //! The battery values come from the [HeadsetControl] binary, which knows the
 //! vendor protocol of a few hundred headsets - or, for the Audeze Maxwell, from
 //! a native reader that is markedly more reliable (see [`maxwell`]).
 //!
 //! [HeadsetControl]: https://github.com/Sapd/HeadsetControl
+//! [uhid-battery]: https://github.com/GregDuhamel/uhid-battery
 
 pub mod bridge;
 pub mod headset;
@@ -21,5 +25,3 @@ pub mod headsetcontrol;
 pub mod maxwell;
 mod poll;
 pub mod source;
-pub mod systemd;
-pub mod uhid;
