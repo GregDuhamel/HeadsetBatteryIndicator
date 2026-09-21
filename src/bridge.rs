@@ -610,7 +610,7 @@ impl Bridge {
     ) -> Result<()> {
         let uniq = headset.uniq();
         let identity = Identity {
-            name: headset.name.clone(),
+            name: headset.display_name(),
             phys: format!("{PHYS_PREFIX}/{uniq}"),
             uniq: uniq.clone(),
             vendor: u32::from(headset.vendor_id),
