@@ -477,8 +477,8 @@ dependencies = [
 
 [[package]]
 name = "uhid-battery"
-version = "0.1.0"
-source = "git+https://github.com/GregDuhamel/uhid-battery?tag=v0.1.0#7cfe793cb650c7d2cc2c05ad7b535746a19884c7"
+version = "0.1.2"
+source = "git+https://github.com/GregDuhamel/uhid-battery?tag=v0.1.2#b1d1832206e67356d6b284691d23e34d8bdbfa9d"
 dependencies = [
  "rustix",
 ]

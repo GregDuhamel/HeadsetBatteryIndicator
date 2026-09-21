@@ -6,6 +6,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
 
 const BIN: &str = env!("CARGO_BIN_EXE_headset-battery-indicator");
 
@@ -18,8 +19,34 @@ fn bin() -> Command {
     command
 }
 
-/// Writes an executable stub that prints `payload` and exits.
-fn stub(name: &str, body: &str) -> PathBuf {
+/// Serialises the tests below.
+///
+/// Each writes a script and has the binary under test execute it. Run in
+/// parallel, one thread forks while another still holds its script open for
+/// writing; the child inherits that descriptor for an instant, and the kernel
+/// refuses to execute a file that is open for writing anywhere: `ETXTBSY`,
+/// "Text file busy". It only shows up now and then, which is worse than always.
+static EXEC_LOCK: Mutex<()> = Mutex::new(());
+
+/// Takes the lock. Every test that forks needs it, stub or no stub: it is the
+/// forking thread that ends up holding somebody else's script open.
+fn serialise() -> MutexGuard<'static, ()> {
+    EXEC_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// An executable stub, and the lock that keeps other tests from forking while
+/// it exists.
+struct Stub {
+    path: PathBuf,
+    _serialised: MutexGuard<'static, ()>,
+}
+
+/// Writes an executable stub that runs `body`.
+fn stub(name: &str, body: &str) -> Stub {
+    let serialised = serialise();
+
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
     fs::create_dir_all(&dir).expect("creating the stub directory");
 
@@ -27,19 +54,23 @@ fn stub(name: &str, body: &str) -> PathBuf {
     fs::write(&path, body).expect("writing the stub");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
         .expect("making the stub runnable");
-    path
+    Stub {
+        path,
+        _serialised: serialised,
+    }
 }
 
-fn printing_stub(name: &str, fixture: &str) -> PathBuf {
+fn printing_stub(name: &str, fixture: &str) -> Stub {
     let payload = fs::read_to_string(Path::new("tests/fixtures").join(fixture)).expect("fixture");
     stub(name, &format!("#!/bin/sh\ncat <<'JSON'\n{payload}\nJSON\n"))
 }
 
 #[test]
 fn status_reports_the_battery_level() {
+    let stub = printing_stub("status-ok", "maxwell-discharging.json");
     let output = bin()
         .args(["--headsetcontrol"])
-        .arg(printing_stub("status-ok", "maxwell-discharging.json"))
+        .arg(&stub.path)
         .arg("status")
         .output()
         .expect("running the binary");
@@ -59,9 +90,10 @@ fn status_reports_the_battery_level() {
 
 #[test]
 fn status_says_when_the_headset_is_off() {
+    let stub = printing_stub("status-off", "maxwell-unavailable.json");
     let output = bin()
         .args(["--headsetcontrol"])
-        .arg(printing_stub("status-off", "maxwell-unavailable.json"))
+        .arg(&stub.path)
         .arg("status")
         .output()
         .expect("running the binary");
@@ -72,9 +104,10 @@ fn status_says_when_the_headset_is_off() {
 
 #[test]
 fn udev_rules_are_generated_for_the_detected_headset() {
+    let stub = printing_stub("udev", "maxwell-charging.json");
     let output = bin()
         .args(["--headsetcontrol"])
-        .arg(printing_stub("udev", "maxwell-charging.json"))
+        .arg(&stub.path)
         .args(["udev-rules", "--group", "gamers"])
         .output()
         .expect("running the binary");
@@ -96,6 +129,7 @@ fn udev_rules_are_generated_for_the_detected_headset() {
 
 #[test]
 fn a_missing_headsetcontrol_is_an_error_not_a_panic() {
+    let _serialised = serialise();
     let output = bin()
         .args(["--headsetcontrol", "/nonexistent/headsetcontrol", "status"])
         .output()
@@ -107,10 +141,10 @@ fn a_missing_headsetcontrol_is_an_error_not_a_panic() {
 
 #[test]
 fn garbage_output_is_reported_with_context() {
-    let path = stub("garbage", "#!/bin/sh\necho 'segmentation fault'\n");
+    let stub = stub("garbage", "#!/bin/sh\necho 'segmentation fault'\n");
     let output = bin()
         .arg("--headsetcontrol")
-        .arg(path)
+        .arg(&stub.path)
         .arg("status")
         .output()
         .expect("running the binary");
@@ -122,11 +156,11 @@ fn garbage_output_is_reported_with_context() {
 
 #[test]
 fn a_hanging_headsetcontrol_is_killed() {
-    let path = stub("hang", "#!/bin/sh\nsleep 30\n");
+    let stub = stub("hang", "#!/bin/sh\nsleep 30\n");
     let started = std::time::Instant::now();
     let output = bin()
         .arg("--headsetcontrol")
-        .arg(path)
+        .arg(&stub.path)
         .args(["--timeout", "1", "status"])
         .output()
         .expect("running the binary");
