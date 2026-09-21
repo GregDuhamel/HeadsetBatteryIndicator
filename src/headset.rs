@@ -30,6 +30,11 @@ pub struct Headset {
     pub supports_battery: bool,
     /// Last known battery state.
     pub battery: BatteryState,
+    /// Which reading `battery` comes from, for a reader that reports the same
+    /// reading on several polls in a row; `None` for one that reads afresh each
+    /// time. It lets a consumer tell a second opinion from the first one
+    /// repeated.
+    pub sample: Option<u64>,
 }
 
 impl Headset {

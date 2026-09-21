@@ -1,8 +1,9 @@
 //! Where battery readings come from.
 //!
 //! HeadsetControl knows a few hundred headsets and is the general answer. For
-//! the hardware this crate can talk to itself, the native reader is both far
-//! more reliable and about forty times faster, so it goes first.
+//! the hardware this crate can talk to itself the native reader goes first: it
+//! is far more reliable, and it listens to the dongle instead of polling the
+//! headset, which is both quicker to notice a change and kinder to the dongle.
 
 use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
@@ -12,6 +13,10 @@ use anyhow::Result;
 use crate::headset::Headset;
 use crate::headsetcontrol::HeadsetControl;
 use crate::maxwell;
+
+/// Default for how often the native reader asks a linked headset for its level,
+/// in seconds.
+pub const DEFAULT_NATIVE_INTERVAL_SECS: u64 = 60;
 
 /// How long a vanished dongle is given to re-enumerate before HeadsetControl is
 /// tried instead. It takes two or three seconds.
@@ -64,8 +69,14 @@ impl Source {
     pub fn describe(&self) -> String {
         let binary = self.control.binary().display();
         match self.backend {
-            Backend::Auto => format!("the native reader, falling back to {binary}"),
-            Backend::Native => "the native reader".to_owned(),
+            Backend::Auto => format!(
+                "the native reader (asking a linked headset every {:?}), falling back to {binary}",
+                self.native_interval
+            ),
+            Backend::Native => format!(
+                "the native reader (asking a linked headset every {:?})",
+                self.native_interval
+            ),
             Backend::HeadsetControl => binary.to_string(),
         }
     }
