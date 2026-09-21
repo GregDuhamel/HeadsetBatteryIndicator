@@ -10,12 +10,12 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use headset_battery_indicator::bridge::{
-    Bridge, Config, DEFAULT_INTERVAL_SECS, DEFAULT_MISSING_GRACE_SECS,
-    DEFAULT_NATIVE_INTERVAL_SECS, DEFAULT_OFFLINE_GRACE_SECS, PHYS_PREFIX,
+    Bridge, Config, DEFAULT_INTERVAL_SECS, DEFAULT_MISSING_GRACE_SECS, DEFAULT_OFFLINE_GRACE_SECS,
+    PHYS_PREFIX,
 };
 use headset_battery_indicator::headset::BatteryState;
 use headset_battery_indicator::headsetcontrol::HeadsetControl;
-use headset_battery_indicator::source::{Backend, Source};
+use headset_battery_indicator::source::{Backend, DEFAULT_NATIVE_INTERVAL_SECS, Source};
 use log::{LevelFilter, error};
 use uhid_battery::{DEV_UHID, Handle, Kind, find_power_supply};
 
@@ -202,7 +202,6 @@ fn run(args: &RunArgs, source: Source) -> Result<()> {
 
     let config = Config {
         interval: Duration::from_secs(args.interval.max(1)),
-        native_interval: Duration::from_secs(args.native_interval.max(1)),
         offline_grace: Duration::from_secs(args.offline_grace),
         missing_grace: Duration::from_secs(args.missing_grace),
         uhid_path: args.uhid.clone(),

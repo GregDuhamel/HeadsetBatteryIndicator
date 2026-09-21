@@ -1,6 +1,6 @@
 [package]
 name = "headset-battery-indicator"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.85"
 description = "Publishes the battery level reported by HeadsetControl to UPower, so wireless headsets show up in KDE's Power & Battery"
@@ -20,7 +20,7 @@ rustix = { version = "1.1.5", features = ["event", "fs", "std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Not on crates.io: a git dependency, pinned to a release tag like razerd's.
-uhid-battery = { git = "https://github.com/GregDuhamel/uhid-battery", tag = "v0.1.2" }
+uhid-battery = { git = "https://github.com/GregDuhamel/uhid-battery", tag = "v0.2.0" }
 signal-hook = { version = "0.4", default-features = false }
 
 [lints.rust]

@@ -156,6 +156,8 @@ impl From<Device> for Headset {
             product_id: parse_id(&device.id_product),
             supports_battery,
             battery,
+            // Every probe runs the binary again: each reading is a new one.
+            sample: None,
         }
     }
 }

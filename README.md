@@ -96,10 +96,11 @@ The dongle's input report is really a stream of small messages,
 05 5d 05 00  d6 0c 00 00 5b    answer: 0x5b = 91 %
 ```
 
-The native reader sends that single request, polls the input report until the
-*answer* message (type `5d`) shows up, and rejects any level above 100. Measured
-side by side on a Maxwell Xbox dongle: 60 reads out of 60 in 0.06 s each, against
-intermittent failures and 2.7 s per read for HeadsetControl.
+The native reader matches whole message headers - the *answer* (type `5d`), not
+the acknowledgement that echoes the same command - and rejects any level above
+100. Measured side by side on a Maxwell Xbox dongle: 60 reads out of 60, against
+intermittent failures and 2.7 s per read for HeadsetControl. It does not poll
+the headset, though; see [below](#the-native-reader-listens-it-does-not-ask).
 
 Two more things the frames taught us. The report is a buffer the dongle fills
 from the start, and its second byte counts the bytes written since it was last

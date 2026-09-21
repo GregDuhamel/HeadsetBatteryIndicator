@@ -1,6 +1,7 @@
 //! The daemon itself: read the batteries, mirror them onto virtual HID
 //! batteries, and keep answering the kernel in between.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -15,13 +16,17 @@ use uhid_battery::{Battery, DEV_UHID, Handle, Identity, Kind};
 
 /// Default for [`Config::interval`], in seconds.
 pub const DEFAULT_INTERVAL_SECS: u64 = 60;
-/// Default for [`Config::native_interval`], in seconds.
-pub const DEFAULT_NATIVE_INTERVAL_SECS: u64 = 60;
-
 /// How often the native reader is run. It only listens to the dongle - nothing
 /// goes over the air - and that is how it learns within a second that the
 /// headset came or went.
 const NATIVE_TICK: Duration = Duration::from_secs(1);
+
+/// How long to wait before trying again to create a virtual battery that could
+/// not be created. The native reader comes round every second; without this a
+/// lasting failure - no uhid descriptor left, a kernel without HID battery
+/// support - would create and destroy a device, and log an error, every second
+/// for as long as it lasts.
+const ATTACH_RETRY: Duration = Duration::from_secs(60);
 
 /// How long the dongle has to keep saying the headset is gone before it is
 /// believed. The link drops for a second while a freshly powered headset
@@ -161,6 +166,20 @@ fn withdrawal(silent_for: Duration, missing_for: Duration, config: &Config) -> W
     }
 }
 
+/// The deferred reading, if the one at hand can confirm it.
+///
+/// A reader that caches the level reports the same reading on every poll until
+/// a new one comes in. Held back once, such a reading would otherwise confirm
+/// itself a second later: a second opinion has to be a second reading.
+fn second_opinion(
+    deferred: Option<u8>,
+    deferred_sample: Option<u64>,
+    sample: Option<u64>,
+) -> Option<u8> {
+    let same_reading = sample.is_some() && sample == deferred_sample;
+    deferred.filter(|_| !same_reading)
+}
+
 /// What to do with a freshly read battery level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {
@@ -190,10 +209,6 @@ pub struct Config {
     /// Delay between two readings through HeadsetControl, which is expensive:
     /// twenty packets and close to three seconds each.
     pub interval: Duration,
-    /// How often the native reader asks a linked headset for its level. It
-    /// learns about the headset coming and going by listening, every second,
-    /// and never asks a headset that is gone; see [`crate::maxwell`].
-    pub native_interval: Duration,
     /// How long a headset that is still detected, but no longer answering
     /// battery queries, keeps its entry: long enough for a few retries, so one
     /// lost reading does not make the applet blink, and no longer - the way a
@@ -217,7 +232,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             interval: Duration::from_secs(DEFAULT_INTERVAL_SECS),
-            native_interval: Duration::from_secs(DEFAULT_NATIVE_INTERVAL_SECS),
             offline_grace: Duration::from_secs(DEFAULT_OFFLINE_GRACE_SECS),
             missing_grace: Duration::from_secs(DEFAULT_MISSING_GRACE_SECS),
             uhid_path: PathBuf::from(DEV_UHID),
@@ -245,8 +259,10 @@ struct VirtualBattery {
     missing_since: Option<Instant>,
     /// Since when the reader has been saying the headset is gone.
     gone_since: Option<Instant>,
-    /// A reading that was too far off to publish, waiting for confirmation.
+    /// A reading that was too far off to publish, waiting for confirmation,
+    /// and which reading that was.
     deferred: Option<u8>,
+    deferred_sample: Option<u64>,
     /// The level the last INFO line mentioned.
     logged_percent: u8,
     /// When a reading was last pushed to the kernel.
@@ -323,6 +339,8 @@ pub struct Bridge {
     pool: DevicePool,
     batteries: Vec<VirtualBattery>,
     probe_failing: bool,
+    /// Headsets whose battery could not be created, and when to try again.
+    attach_retry_at: BTreeMap<String, Instant>,
     last_summary: Option<Summary>,
     /// A summary that differs from the announced one, and since when.
     unsettled: Option<(Summary, Instant)>,
@@ -339,6 +357,7 @@ impl Bridge {
             pool,
             batteries: Vec::new(),
             probe_failing: false,
+            attach_retry_at: BTreeMap::new(),
             last_summary: None,
             unsettled: None,
         }
@@ -352,11 +371,9 @@ impl Bridge {
     /// failing reader is logged and retried on the next tick.
     pub fn run(&mut self, stop: &AtomicBool) -> Result<()> {
         info!(
-            "reading batteries with {} (natively: listening every {:?}, asking every {:?}; \
-             otherwise every {:?})",
+            "reading batteries with {}; passes every {:?} natively, every {:?} otherwise",
             self.source.describe(),
             NATIVE_TICK,
-            self.config.native_interval,
             self.config.interval
         );
 
@@ -527,7 +544,20 @@ impl Bridge {
         };
 
         let Some(index) = existing else {
-            return self.attach(headset, percent, charging, now);
+            if self
+                .attach_retry_at
+                .get(&key)
+                .is_some_and(|retry_at| now < *retry_at)
+            {
+                return Ok(());
+            }
+            let attached = self.attach(headset, percent, charging, now);
+            if attached.is_ok() {
+                self.attach_retry_at.remove(&key);
+            } else {
+                self.attach_retry_at.insert(key, now + ATTACH_RETRY);
+            }
+            return attached;
         };
 
         let battery = &mut self.batteries[index];
@@ -537,15 +567,18 @@ impl Bridge {
         battery.gone_since = None;
 
         let (known_percent, known_charging) = (battery.device.percent(), battery.device.charging());
-        if vet(known_percent, percent, battery.deferred) == Verdict::Defer {
+        let confirming = second_opinion(battery.deferred, battery.deferred_sample, headset.sample);
+        if vet(known_percent, percent, confirming) == Verdict::Defer {
             debug!(
                 "{}: holding back an implausible {percent}% (last known {known_percent}%)",
                 battery.name
             );
             battery.deferred = Some(percent);
+            battery.deferred_sample = headset.sample;
             return Ok(());
         }
         battery.deferred = None;
+        battery.deferred_sample = None;
 
         // An unchanged level is still pushed now and then. The kernel drops input
         // reports without telling anyone while it is probing the device, so
@@ -577,7 +610,7 @@ impl Bridge {
     ) -> Result<()> {
         let uniq = headset.uniq();
         let identity = Identity {
-            name: headset.name.clone(),
+            name: headset.display_name(),
             phys: format!("{PHYS_PREFIX}/{uniq}"),
             uniq: uniq.clone(),
             vendor: u32::from(headset.vendor_id),
@@ -629,6 +662,7 @@ impl Bridge {
             missing_since: None,
             gone_since: None,
             deferred: None,
+            deferred_sample: None,
             logged_percent: percent,
             published_at: now,
         });
@@ -723,6 +757,7 @@ mod tests {
             product_id: 0x4b18,
             supports_battery,
             battery,
+            sample: None,
         }
     }
 
@@ -772,6 +807,29 @@ mod tests {
         // the first reading waits, the second one confirms it.
         assert_eq!(vet(92, 40, None), Verdict::Defer);
         assert_eq!(vet(92, 38, Some(40)), Verdict::Accept);
+    }
+
+    #[test]
+    fn a_cached_reading_does_not_confirm_itself() {
+        // The native reader caches the level and is polled every second. A
+        // glitch held back on one poll comes round again on the next: that is
+        // the same reading, not a confirmation.
+        assert_eq!(second_opinion(Some(0), Some(7), Some(7)), None);
+        assert_eq!(
+            vet(92, 0, second_opinion(Some(0), Some(7), Some(7))),
+            Verdict::Defer
+        );
+        // A new reading saying the same thing is one.
+        assert_eq!(second_opinion(Some(0), Some(7), Some(8)), Some(0));
+        assert_eq!(
+            vet(92, 0, second_opinion(Some(0), Some(7), Some(8))),
+            Verdict::Accept
+        );
+        // A reader that reads afresh on every poll has no samples to compare:
+        // each poll is a new reading.
+        assert_eq!(second_opinion(Some(40), None, None), Some(40));
+        // Nothing deferred, nothing to confirm.
+        assert_eq!(second_opinion(None, None, Some(3)), None);
     }
 
     #[test]

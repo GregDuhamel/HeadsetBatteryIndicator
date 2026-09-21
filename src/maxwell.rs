@@ -240,10 +240,11 @@ enum Message {
 #[derive(Debug)]
 struct Session {
     file: File,
-    product: String,
     product_id: u16,
     link: Link,
     level: Option<u8>,
+    /// How many battery messages this session has received.
+    readings: u64,
     opened_at: Instant,
     /// When a battery request was last sent, and how many were in this session.
     asked_at: Option<Instant>,
@@ -266,10 +267,10 @@ impl Session {
             .open(&dongle.node)?;
         Ok(Self {
             file,
-            product: dongle.product.clone(),
             product_id: dongle.product_id,
             link,
             level: None,
+            readings: 0,
             opened_at: Instant::now(),
             asked_at: None,
             asks: 0,
@@ -303,6 +304,7 @@ impl Session {
                     trace!("battery: {level}%");
                     self.link = Link::Up;
                     self.level = Some(level);
+                    self.readings += 1;
                     self.pending = false;
                     self.unanswered = 0;
                 }
@@ -311,8 +313,8 @@ impl Session {
         Ok(())
     }
 
-    /// Whether a battery request is due. Never while the headset is known to be
-    /// gone, which is the whole point.
+    /// Whether a battery request is due: regularly while the headset is linked,
+    /// and otherwise a strictly bounded number of times per session.
     fn should_ask(&self, now: Instant, interval: Duration, listen_first: Duration) -> bool {
         match self.link {
             Link::Up => self
@@ -323,8 +325,9 @@ impl Session {
             // avoid, so there is a hard ceiling rather than a slow retry.
             Link::Unknown => match (self.asked_at, self.asks) {
                 (None, _) => now.duration_since(self.opened_at) >= listen_first,
-                (Some(at), asks) => usize::try_from(asks - 1)
-                    .ok()
+                (Some(at), asks) => asks
+                    .checked_sub(1)
+                    .and_then(|extra| usize::try_from(extra).ok())
                     .and_then(|index| ASK_AGAIN_AFTER.get(index))
                     .is_some_and(|delay| now.duration_since(at) >= *delay),
             },
@@ -419,21 +422,22 @@ impl Reader {
         dongles
             .iter()
             .map(|dongle| {
-                let battery = match self.listen_to(dongle, now, interval, listen_first, wired) {
-                    Ok(battery) => {
-                        report_recovery();
-                        battery
-                    }
-                    Err(err) => {
-                        // Most often the node vanishing mid-exchange, or not
-                        // having its permissions yet right after coming back.
-                        if let Some(session) = self.sessions.remove(&dongle.node) {
-                            self.last_link.insert(session.product_id, session.link);
+                let (battery, sample) =
+                    match self.listen_to(dongle, now, interval, listen_first, wired) {
+                        Ok(reading) => {
+                            report_recovery();
+                            reading
                         }
-                        report_error(&dongle.node, &err);
-                        BatteryState::Unavailable
-                    }
-                };
+                        Err(err) => {
+                            // Most often the node vanishing mid-exchange, or not
+                            // having its permissions yet right after coming back.
+                            if let Some(session) = self.sessions.remove(&dongle.node) {
+                                self.last_link.insert(session.product_id, session.link);
+                            }
+                            report_error(&dongle.node, &err);
+                            (BatteryState::Unavailable, 0)
+                        }
+                    };
                 Headset {
                     name: "Audeze Maxwell".to_owned(),
                     product: dongle.product.clone(),
@@ -441,6 +445,9 @@ impl Reader {
                     product_id: dongle.product_id,
                     supports_battery: true,
                     battery,
+                    // The level is cached between the dongle's messages, and this
+                    // runs every second: say which message it came from.
+                    sample: Some(sample),
                 }
             })
             .collect()
@@ -472,7 +479,7 @@ impl Reader {
         interval: Duration,
         listen_first: Duration,
         wired: bool,
-    ) -> io::Result<BatteryState> {
+    ) -> io::Result<(BatteryState, u64)> {
         if !self.sessions.contains_key(&dongle.node) {
             let link = self
                 .last_link
@@ -480,7 +487,7 @@ impl Reader {
                 .copied()
                 .unwrap_or(Link::Unknown);
             let session = Session::open(dongle, link)?;
-            debug!("opened {} ({})", dongle.node.display(), session.product);
+            debug!("opened {} ({})", dongle.node.display(), dongle.product);
             self.sessions.insert(dongle.node.clone(), session);
         }
         let session = self
@@ -492,7 +499,7 @@ impl Reader {
         if session.should_ask(now, interval, listen_first) {
             session.ask(now)?;
         }
-        Ok(session.battery(wired))
+        Ok((session.battery(wired), session.readings))
     }
 }
 
@@ -722,10 +729,10 @@ mod tests {
     fn session(link: Link, level: Option<u8>, asked: Option<Instant>) -> Session {
         Session {
             file: File::open("/dev/null").unwrap(),
-            product: "test".to_owned(),
             product_id: 0x4b18,
             link,
             level,
+            readings: u64::from(level.is_some()),
             opened_at: Instant::now(),
             asked_at: asked,
             asks: u32::from(asked.is_some()),
