@@ -163,9 +163,44 @@ const _: () = assert!(MAX_UNANSWERED as usize > ASK_AGAIN_AFTER.len());
 /// permissions udev is about to give it, and that happens at every link change.
 const ERROR_SETTLE: Duration = Duration::from_secs(5);
 
-/// The access error being watched: its text, since when, and whether it has
-/// been reported yet - once it has, it is not reported again.
-static LAST_ERROR: Mutex<Option<(String, Instant, bool)>> = Mutex::new(None);
+/// The access error being watched, and whether it is worth a line yet.
+///
+/// What it decides is kept apart from the logging, so that it can be tested
+/// with instants of the test's choosing; the one instance lives in
+/// [`ACCESS`], and [`report_error`] and [`report_recovery`] do the talking.
+#[derive(Debug)]
+struct AccessWatch {
+    /// The error's text, since when it has been seen, and whether it has
+    /// been reported - once it has, it is not reported again.
+    last: Option<(String, Instant, bool)>,
+}
+
+impl AccessWatch {
+    const fn new() -> Self {
+        Self { last: None }
+    }
+
+    /// Takes in a failure, and says whether it is worth a warning now: the
+    /// same error has lasted [`ERROR_SETTLE`], and has not been reported.
+    /// A different error starts a new clock.
+    fn failing(&mut self, message: String, now: Instant) -> bool {
+        let (since, reported) = match self.last.as_ref() {
+            Some((previous, since, reported)) if *previous == message => (*since, *reported),
+            _ => (now, false),
+        };
+        let report = !reported && now.duration_since(since) >= ERROR_SETTLE;
+        self.last = Some((message, since, reported || report));
+        report
+    }
+
+    /// Takes in a success, and says whether the recovery is worth a line:
+    /// only if the failure was.
+    fn recovered(&mut self) -> bool {
+        matches!(self.last.take(), Some((_, _, true)))
+    }
+}
+
+static ACCESS: Mutex<AccessWatch> = Mutex::new(AccessWatch::new());
 
 /// Reports a failure to reach a dongle that sysfs says is there, once it has
 /// lasted.
@@ -176,17 +211,12 @@ static LAST_ERROR: Mutex<Option<(String, Instant, bool)>> = Mutex::new(None);
 /// leaves the node showing `crw-rw----` while its ACL says `group::---`.
 fn report_error(node: &Path, err: &io::Error) {
     let message = format!("{}: {err}", node.display());
-    let mut last = LAST_ERROR
+    let report = ACCESS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-    let (since, reported) = match last.as_ref() {
-        Some((previous, since, reported)) if *previous == message => (*since, *reported),
-        _ => (Instant::now(), false),
-    };
-    if reported || since.elapsed() < ERROR_SETTLE {
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .failing(message.clone(), Instant::now());
+    if !report {
         debug!("cannot reach {message}");
-        *last = Some((message, since, reported));
         return;
     }
 
@@ -200,15 +230,14 @@ fn report_error(node: &Path, err: &io::Error) {
     } else {
         warn!("cannot query {message}");
     }
-    *last = Some((message, since, true));
 }
 
 fn report_recovery() {
-    let mut last = LAST_ERROR
+    let recovered = ACCESS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // Only worth a line if the failure was.
-    if let Some((_, _, true)) = last.take() {
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .recovered();
+    if recovered {
         info!("the dongle is reachable again");
     }
 }
@@ -1074,6 +1103,115 @@ mod tests {
         assert_eq!(
             discover_in(Path::new("/nonexistent/hidraw"), Path::new("/dev")),
             [] as [Dongle; 0]
+        );
+    }
+
+    #[test]
+    fn an_access_error_is_reported_once_it_has_lasted_and_only_once() {
+        let mut watch = AccessWatch::new();
+        let start = Instant::now();
+        let denied = || "/dev/hidraw3: Permission denied".to_owned();
+
+        // Right after the dongle re-enumerates its node exists for a moment
+        // without its permissions: not news yet.
+        assert!(!watch.failing(denied(), start));
+        assert!(!watch.failing(denied(), start + ERROR_SETTLE / 2));
+        // Lasted: said, once.
+        assert!(watch.failing(denied(), start + ERROR_SETTLE));
+        assert!(!watch.failing(denied(), start + ERROR_SETTLE * 2));
+        assert!(!watch.failing(denied(), start + Duration::from_secs(3600)));
+
+        // The recovery is worth a line, because the failure was.
+        assert!(watch.recovered());
+        assert!(!watch.recovered(), "said once too");
+
+        // A failure that never settled is not: nothing was said about it.
+        assert!(!watch.failing(denied(), start));
+        assert!(!watch.recovered());
+
+        // A different error starts its own clock.
+        assert!(!watch.failing(denied(), start));
+        assert!(!watch.failing(
+            "/dev/hidraw3: Inappropriate ioctl".to_owned(),
+            start + ERROR_SETTLE
+        ));
+        assert!(watch.failing(
+            "/dev/hidraw3: Inappropriate ioctl".to_owned(),
+            start + ERROR_SETTLE * 2
+        ));
+    }
+
+    #[test]
+    fn the_headset_going_away_forgets_the_level_and_the_pending_request() {
+        let mut readings = 0;
+        let mut session = session(Link::Up, Some(90), Some(Instant::now()));
+        session.pending = true;
+        session.unanswered = 2;
+
+        // The dongle says the headset is gone: no level to report, and the
+        // request that was out is not going to be answered - nor is it a
+        // strike against the headset.
+        session.take_in(&frame_with(&hex(POWER_OFF)), &mut readings);
+        assert_eq!(session.link, Link::Down);
+        assert_eq!(session.level, None);
+        assert!(!session.pending);
+        assert_eq!(session.unanswered, 0);
+        assert_eq!(session.battery(false), BatteryState::Disconnected);
+
+        // Back on: the link, then the level the dongle volunteers.
+        session.take_in(&frame_with(&hex(POWER_ON)), &mut readings);
+        assert_eq!(session.link, Link::Up);
+        assert_eq!(session.level, Some(99));
+        assert_eq!(session.battery(false), BatteryState::Discharging(99));
+    }
+
+    #[test]
+    fn a_dongle_that_re_enumerates_hands_its_link_to_the_new_session() {
+        // /dev/null and /dev/zero open read/write and answer no ioctl, so
+        // they can stand in for the node before and after re-enumeration.
+        let dongle = |node: &str| Dongle {
+            node: PathBuf::from(node),
+            product: "Audeze Dongle".to_owned(),
+            product_id: 0x4b18,
+        };
+        let now = Instant::now();
+        let minute = Duration::from_secs(60);
+        let mut reader = Reader::new();
+
+        // A first session, which the dongle tells that the headset is off.
+        let before = dongle("/dev/null");
+        reader.reconcile(std::slice::from_ref(&before), false, now, minute, minute);
+        assert_eq!(reader.sessions.len(), 1);
+        let session = reader.sessions.get_mut(&before.node).unwrap();
+        assert_eq!(session.link, Link::Unknown, "a fresh session knows nothing");
+        session.link = Link::Down;
+
+        // The node vanishes: its session goes, and what it knew stays.
+        assert_eq!(reader.reconcile(&[], false, now, minute, minute), []);
+        assert_eq!(reader.sessions.len(), 0);
+        assert_eq!(reader.last_link.get(&0x4b18), Some(&Link::Down));
+
+        // The node that replaces it inherits the belief, so "the headset is
+        // gone" is not forgotten for the second it took to re-enumerate -
+        // and only one question goes out, after listening.
+        let after = dongle("/dev/zero");
+        reader.reconcile(std::slice::from_ref(&after), false, now, minute, minute);
+        let session = reader.sessions.get(&after.node).unwrap();
+        assert_eq!(session.link, Link::Down);
+        assert_eq!(session.battery(false), BatteryState::Disconnected);
+        let opened = session.opened_at;
+        assert!(!session.should_ask(opened, minute, LISTEN_FIRST));
+        assert!(session.should_ask(opened + LISTEN_FIRST, minute, LISTEN_FIRST));
+
+        // A dongle of another model gets no belief from this one.
+        let other = Dongle {
+            product_id: 0x4b19,
+            ..dongle("/dev/null")
+        };
+        reader.reconcile(&[after.clone(), other.clone()], false, now, minute, minute);
+        assert_eq!(
+            reader.sessions.get(&other.node).unwrap().link,
+            Link::Unknown
         );
     }
 }

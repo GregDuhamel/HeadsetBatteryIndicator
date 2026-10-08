@@ -35,6 +35,37 @@ pub enum Backend {
     HeadsetControl,
 }
 
+/// Where the bridge gets its readings from.
+///
+/// [`Source`] in the daemon; the bridge's unit tests script one, so that the
+/// bridge is tested on readings nobody has to plug in. Only what the bridge
+/// asks of a source is here - the one-shot reading of the `status` command
+/// stays on [`Source`].
+pub trait BatterySource {
+    /// A short description, for the startup log line.
+    fn describe(&self) -> String;
+
+    /// Whether the last [`BatterySource::probe`] was answered by the native
+    /// reader.
+    ///
+    /// It matters for pacing: the native reader only listens, so it can - and
+    /// has to - be run every second, where HeadsetControl replays twenty
+    /// packets over 2.7 s.
+    fn last_probe_was_native(&self) -> bool;
+
+    /// Reads the battery state of every headset this source can see.
+    ///
+    /// `stop` cuts a slow reading short; a source that never waits for
+    /// anything may ignore it.
+    ///
+    /// # Errors
+    ///
+    /// The reading failed outright, and no headset is known. A headset that
+    /// is there but cannot be queried is better reported with an unavailable
+    /// battery, so that it keeps its entry through the bridge's graces.
+    fn probe(&mut self, stop: &AtomicBool) -> Result<Vec<Headset>>;
+}
+
 /// A configured source of battery readings.
 #[derive(Debug)]
 pub struct Source {
@@ -64,23 +95,6 @@ impl Source {
         }
     }
 
-    /// A short description, for the startup log line.
-    #[must_use]
-    pub fn describe(&self) -> String {
-        let binary = self.control.binary().display();
-        match self.backend {
-            Backend::Auto => format!(
-                "the native reader (asking a linked headset every {:?}), falling back to {binary}",
-                self.native_interval
-            ),
-            Backend::Native => format!(
-                "the native reader (asking a linked headset every {:?})",
-                self.native_interval
-            ),
-            Backend::HeadsetControl => binary.to_string(),
-        }
-    }
-
     /// Whether a dongle the native reader was listening to vanished only
     /// moments ago.
     ///
@@ -106,7 +120,7 @@ impl Source {
     ///
     /// # Errors
     ///
-    /// Same as [`Source::probe`].
+    /// Same as [`BatterySource::probe`].
     pub fn probe_once(&mut self) -> Result<Vec<Headset>> {
         // Nothing to interrupt a one-shot command with.
         let stop = AtomicBool::new(false);
@@ -120,27 +134,32 @@ impl Source {
             Ok(native)
         }
     }
+}
 
-    /// Whether the last [`Source::probe`] was answered by the native reader.
-    ///
-    /// It matters for pacing: the native reader only listens, so it can - and
-    /// has to - be run every second, where HeadsetControl replays twenty packets
-    /// over 2.7 s.
-    #[must_use]
-    pub fn last_probe_was_native(&self) -> bool {
+impl BatterySource for Source {
+    fn describe(&self) -> String {
+        let binary = self.control.binary().display();
+        match self.backend {
+            Backend::Auto => format!(
+                "the native reader (asking a linked headset every {:?}), falling back to {binary}",
+                self.native_interval
+            ),
+            Backend::Native => format!(
+                "the native reader (asking a linked headset every {:?})",
+                self.native_interval
+            ),
+            Backend::HeadsetControl => binary.to_string(),
+        }
+    }
+
+    fn last_probe_was_native(&self) -> bool {
         self.native
     }
 
-    /// Reads the battery state of every headset this source can see.
-    ///
     /// `stop` cuts a running `headsetcontrol` short; the native reader never
-    /// waits for anything.
-    ///
-    /// # Errors
-    ///
-    /// Only HeadsetControl can fail; the native reader reports a dongle it
-    /// cannot query as an unavailable battery instead.
-    pub fn probe(&mut self, stop: &AtomicBool) -> Result<Vec<Headset>> {
+    /// waits for anything. Only HeadsetControl can fail; the native reader
+    /// reports a dongle it cannot query as an unavailable battery instead.
+    fn probe(&mut self, stop: &AtomicBool) -> Result<Vec<Headset>> {
         self.native = self.backend == Backend::Native;
         match self.backend {
             Backend::Native => Ok(self.listen()),

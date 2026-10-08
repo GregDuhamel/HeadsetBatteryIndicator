@@ -14,6 +14,10 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# The token only needs to read the repository: no job here writes anything.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test (${{ matrix.rust }})
