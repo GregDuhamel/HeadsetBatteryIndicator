@@ -1,6 +1,6 @@
 [package]
 name = "headset-battery-indicator"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Publishes a wireless headset's battery level to UPower - natively for the Audeze Maxwell, through HeadsetControl otherwise - so it shows up in KDE's Power & Battery"
