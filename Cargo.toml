@@ -1,6 +1,6 @@
 [package]
 name = "headset-battery-indicator"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Publishes a wireless headset's battery level to UPower - natively for the Audeze Maxwell, through HeadsetControl otherwise - so it shows up in KDE's Power & Battery"
@@ -16,20 +16,27 @@ anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 log = "0.4"
-# Only for the HIDIOCGINPUT ioctl in `maxwell`; the daemon's `poll()` comes from uhid-battery.
-rustix = "1.1.5"
+# The hidraw transport of the native reader: finding the dongle through sysfs,
+# the output report that asks, the HIDIOCGINPUT ioctl that fetches the answer,
+# and telling an unplugged dongle from a transfer that merely failed. Not on
+# crates.io: a git dependency, pinned to a release tag like uhid-battery.
+hidraw = { git = "https://github.com/GregDuhamel/hidraw", tag = "v0.1.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# Not on crates.io: a git dependency, pinned to a release tag like razerd's.
+# The virtual HID battery: /dev/uhid, the descriptor systemd passes down, and
+# the power supply the kernel builds from it. Not on crates.io either.
 uhid-battery = { git = "https://github.com/GregDuhamel/uhid-battery", tag = "v0.4.0" }
 signal-hook = { version = "0.4", default-features = false }
 
 [dev-dependencies]
-# Scratch directories standing in for sysfs, removed when the test is done.
+# Scratch directories standing in for sysfs (the hidraw class and the USB bus),
+# removed when the test is done.
 tempfile = "3"
 
 [lints.rust]
 missing_docs = "warn"
+# The system calls go through hidraw and uhid-battery, which wrap them safely;
+# the one exception is adopting systemd's descriptors in main.rs.
 unsafe_code = "deny"
 
 [lints.clippy]

@@ -26,6 +26,17 @@
 //! The answers are only available through a `GET_REPORT` control transfer
 //! (`HIDIOCGINPUT`); the dongle never pushes them on the interrupt endpoint.
 //!
+//! # The transport
+//!
+//! Everything that touches the kernel goes through the [`hidraw`] crate,
+//! shared with the other daemons of this account: [`hidraw::discover`] lists
+//! `/sys/class/hidraw` and tells the USB dongle from the virtual battery this
+//! daemon publishes under the same IDs, [`Device::write`] sends the request as
+//! an output report, [`Device::get_input`] fetches the answer, and
+//! [`hidraw::is_gone`] tells an unplugged dongle from a transfer that merely
+//! failed. What stays here is the dongle's side of it: its IDs, its report
+//! layout, and when to ask.
+//!
 //! # Listen, do not ask
 //!
 //! The dongle announces the headset's link state on its own, and volunteers the
@@ -60,14 +71,14 @@
 //! wall charger is invisible, and keeps reading as discharging.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::os::fd::AsFd;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use hidraw::{Bus, Device, Filter};
 use log::{debug, info, trace, warn};
 
 use crate::headset::{BatteryState, Headset};
@@ -81,17 +92,14 @@ pub const PRODUCT_IDS: [u16; 2] = [
     0x4b18, // Maxwell Xbox dongle
 ];
 
-/// Where the kernel lists hidraw nodes.
-const HIDRAW_CLASS: &str = "/sys/class/hidraw";
-
-/// Where the kernel lists USB devices.
+/// Where the kernel lists USB devices. It is read for the wired headset (see
+/// [`headset_is_wired`]); the dongle's hidraw nodes come from
+/// [`hidraw::discover`].
 const USB_DEVICES: &str = "/sys/bus/usb/devices";
 
-/// `BUS_USB`. The virtual battery this daemon creates carries the dongle's
-/// vendor and product IDs too, on `BUS_VIRTUAL`, and has a hidraw node of its
-/// own: without this check the reader would mistake it for a second dongle and
-/// start sending it battery requests.
-const BUS_USB: u16 = 0x0003;
+/// What the dongle's product string is reported as when the kernel has none
+/// for it (`HID_NAME` missing from the uevent, which usbhid never leaves out).
+const DEFAULT_PRODUCT: &str = "Audeze Maxwell";
 
 /// Every report the dongle exchanges is this long, report ID included.
 const MSG_SIZE: usize = 62;
@@ -254,7 +262,7 @@ enum Message {
 /// One open dongle, and what is known about the headset behind it.
 #[derive(Debug)]
 struct Session {
-    file: File,
+    device: Device,
     product_id: u16,
     link: Link,
     level: Option<u8>,
@@ -277,12 +285,9 @@ impl Session {
     /// forgetting what it had just announced would turn an instant "the headset
     /// is gone" back into a guess.
     fn open(dongle: &Dongle, link: Link) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&dongle.node)?;
+        let device = Device::open(&dongle.node)?;
         Ok(Self {
-            file,
+            device,
             product_id: dongle.product_id,
             link,
             level: None,
@@ -298,7 +303,7 @@ impl Session {
     /// Fetches the report and takes in whatever it says. `readings` is the
     /// reader's count of battery messages, which every level is numbered by.
     fn listen(&mut self, readings: &mut u64) -> io::Result<()> {
-        let frame = get_input_report(&self.file)?;
+        let frame = fetch(&self.device)?;
         self.take_in(&frame, readings);
         Ok(())
     }
@@ -390,9 +395,11 @@ impl Session {
             return Ok(());
         }
 
+        // One output report, report ID first (`BATTERY_REQUEST[0]`), padded to
+        // the dongle's fixed report size.
         let mut request = [0u8; MSG_SIZE];
         request[..BATTERY_REQUEST.len()].copy_from_slice(&BATTERY_REQUEST);
-        self.file.write_all(&request)?;
+        self.device.write(&request)?;
         self.asked_at = Some(now);
         self.asks += 1;
         self.pending = true;
@@ -442,9 +449,21 @@ impl Reader {
 
     fn poll_with(&mut self, interval: Duration, listen_first: Duration) -> Vec<Headset> {
         let wired = headset_is_wired(Path::new(USB_DEVICES));
-        let dongles = discover(Path::new(HIDRAW_CLASS));
-        let now = Instant::now();
+        let dongles = discover();
+        self.reconcile(&dongles, wired, Instant::now(), interval, listen_first)
+    }
 
+    /// One pass over the dongles sysfs currently lists: sessions of nodes that
+    /// are gone are closed, the rest are listened to, and every dongle is
+    /// reported as a headset.
+    fn reconcile(
+        &mut self,
+        dongles: &[Dongle],
+        wired: bool,
+        now: Instant,
+        interval: Duration,
+        listen_first: Duration,
+    ) -> Vec<Headset> {
         // A node that is gone takes its session with it: the dongle
         // re-enumerates after every link change.
         let last_link = &mut self.last_link;
@@ -466,10 +485,27 @@ impl Reader {
                             reading
                         }
                         Err(err) => {
-                            // Most often the node vanishing mid-exchange, or not
-                            // having its permissions yet right after coming back.
-                            if let Some(session) = self.sessions.remove(&dongle.node) {
-                                self.last_link.insert(session.product_id, session.link);
+                            // Only a dongle that is gone - `ENODEV`, the node
+                            // vanishing mid-exchange as it re-enumerates - loses
+                            // its session; the node that replaces it starts a
+                            // new one anyway. Every other failure keeps it: a
+                            // transfer the dongle did not take (`EIO`, `EPIPE`,
+                            // `ETIMEDOUT`), or a kernel without the ioctl, says
+                            // nothing about the headset, and closing the session
+                            // would throw away the link belief and, above all,
+                            // the questions already asked - the new session would
+                            // listen, then ask again, which is the request budget
+                            // this module exists to protect. (It used to close
+                            // on any error; the two cases that motivated it, the
+                            // node vanishing and a node not yet having its
+                            // permissions, are a gone device and a failed open,
+                            // and are handled the same as before.) The level is
+                            // withheld while the failure lasts, and the bridge's
+                            // graces decide what becomes of the entry.
+                            if hidraw::is_gone(&err) {
+                                if let Some(session) = self.sessions.remove(&dongle.node) {
+                                    self.last_link.insert(session.product_id, session.link);
+                                }
                             }
                             report_error(&dongle.node, &err);
                             (BatteryState::Unavailable, 0)
@@ -544,54 +580,55 @@ impl Reader {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Dongle {
     node: PathBuf,
+    /// The kernel's name for the device (`HID_NAME`, the USB manufacturer and
+    /// product strings), reported as [`Headset::product`].
     product: String,
     product_id: u16,
 }
 
-/// Lists the hidraw nodes that belong to a supported dongle.
-fn discover(class_dir: &Path) -> Vec<Dongle> {
-    let Ok(entries) = fs::read_dir(class_dir) else {
-        return Vec::new();
-    };
-
-    let mut dongles: Vec<Dongle> = entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let uevent = fs::read_to_string(entry.path().join("device/uevent")).ok()?;
-            let (bus, vendor_id, product_id, product) = parse_uevent(&uevent)?;
-            (bus == BUS_USB && supports(vendor_id, product_id)).then(|| Dongle {
-                node: Path::new("/dev").join(entry.file_name()),
-                product,
-                product_id,
-            })
+impl Dongle {
+    /// The dongle behind a hidraw node, if the node is one. [`discover`] has
+    /// already kept Audeze's devices on USB; the product ID is what is left to
+    /// check.
+    fn from_node(node: hidraw::Node) -> Option<Self> {
+        supports(node.vendor, node.product).then(|| Self {
+            node: node.path,
+            product: if node.name.is_empty() {
+                DEFAULT_PRODUCT.to_owned()
+            } else {
+                node.name
+            },
+            product_id: node.product,
         })
-        .collect();
-    dongles.sort_by(|a, b| a.node.cmp(&b.node));
-    dongles
+    }
 }
 
-/// Extracts the bus, the USB IDs and the product name from a HID device's
-/// `uevent`.
+/// Lists the hidraw nodes that belong to a supported dongle, without opening
+/// them.
 ///
-/// The relevant lines look like `HID_ID=0003:00003329:00004B18` and
-/// `HID_NAME=Audeze LLC Audeze Maxwell XBOX Dongle`.
-fn parse_uevent(uevent: &str) -> Option<(u16, u16, u16, String)> {
-    let field = |key: &str| {
-        uevent
-            .lines()
-            .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
-    };
+/// Only the USB bus is looked at. The virtual battery this daemon creates
+/// carries the dongle's vendor and product IDs too, on `BUS_VIRTUAL`, and has
+/// a hidraw node of its own: without the bus filter the reader would mistake
+/// it for a second dongle and start sending it battery requests.
+fn discover() -> Vec<Dongle> {
+    discover_in(Path::new(hidraw::SYSFS_ROOT), Path::new(hidraw::DEV_ROOT))
+}
 
-    let mut ids = field("HID_ID")?.split(':');
-    let bus = u16::from_str_radix(ids.next()?, 16).ok()?;
-    let vendor = u32::from_str_radix(ids.next()?, 16).ok()?;
-    let product = u32::from_str_radix(ids.next()?, 16).ok()?;
-    Some((
-        bus,
-        u16::try_from(vendor).ok()?,
-        u16::try_from(product).ok()?,
-        field("HID_NAME").unwrap_or("Audeze Maxwell").to_owned(),
-    ))
+/// As [`discover`], with the hidraw class directory and the device directory
+/// given, so that a fake tree can stand in for sysfs under test.
+///
+/// A sysfs that cannot be listed is reported as no dongle at all, as a reader
+/// that runs every second must not fail over it; the bridge says so when it
+/// lasts.
+fn discover_in(sysfs_root: &Path, dev_root: &Path) -> Vec<Dongle> {
+    let filter = Filter::new().bus(Bus::Usb).vendor(VENDOR_ID);
+    match hidraw::discover_in(sysfs_root, dev_root, &filter) {
+        Ok(nodes) => nodes.into_iter().filter_map(Dongle::from_node).collect(),
+        Err(err) => {
+            debug!("cannot list {}: {err}", sysfs_root.display());
+            Vec::new()
+        }
+    }
 }
 
 /// The part of an input report written since it was last fetched.
@@ -626,36 +663,27 @@ fn messages(frame: &[u8]) -> Vec<Message> {
         .collect()
 }
 
-/// `HIDIOCGINPUT`: fetches the current value of an input report.
+/// Fetches the current value of the dongle's answer report (`HIDIOCGINPUT`,
+/// [`Device::get_input`]).
 ///
 /// The dongle never pushes its answers on the interrupt endpoint - a plain
 /// `read()` on the hidraw node sees nothing - so they have to be fetched with a
-/// `GET_REPORT` control transfer, which hidraw only exposes through this ioctl.
-fn get_input_report(device: &impl AsFd) -> io::Result<[u8; MSG_SIZE]> {
-    use rustix::ioctl::{Updater, ioctl, opcode};
-
-    const HIDIOCGINPUT: rustix::ioctl::Opcode = opcode::read_write::<[u8; MSG_SIZE]>(b'H', 0x0a);
-
-    // The first byte tells the kernel which report we want.
+/// `GET_REPORT` control transfer, which hidraw only exposes through that ioctl.
+/// The report is always [`MSG_SIZE`] bytes, so the buffer is that large and
+/// the count the kernel returns is not needed: a shorter answer would leave
+/// zeros behind it, and zeros say nothing (see [`messages`]).
+fn fetch(device: &Device) -> io::Result<[u8; MSG_SIZE]> {
+    // Byte 0 tells the kernel which report is wanted; the report overwrites it.
     let mut frame = [0u8; MSG_SIZE];
     frame[0] = REPLY_REPORT_ID;
-
-    // SAFETY: `HIDIOCGINPUT(len)` reads the report ID from, and writes at most
-    // `len` bytes into, the buffer it is given. The opcode encodes
-    // `len = MSG_SIZE`, which is exactly the size of `frame`, and `frame`
-    // outlives the call.
-    #[allow(unsafe_code)]
-    unsafe {
-        ioctl(
-            device,
-            Updater::<HIDIOCGINPUT, [u8; MSG_SIZE]>::new(&mut frame),
-        )?;
-    }
+    device.get_input(&mut frame)?;
     Ok(frame)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
+
     use super::*;
 
     /// Captured from a Maxwell Xbox dongle right after a battery request, with
@@ -763,9 +791,17 @@ mod tests {
         assert_eq!(messages(&frame).last(), Some(&Message::Battery(91)));
     }
 
+    /// A session on `/dev/null`: it swallows what is written and answers no
+    /// ioctl, so a battery request goes nowhere and a fetch fails with
+    /// `ENOTTY` - a failure that is not a gone device.
     fn session(link: Link, level: Option<u8>, asked: Option<Instant>) -> Session {
+        let null = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
         Session {
-            file: File::open("/dev/null").unwrap(),
+            device: Device::from_fd(null, "/dev/null"),
             product_id: 0x4b18,
             link,
             level,
@@ -853,7 +889,6 @@ mod tests {
         // Second line of defence: requests must not pile up behind a headset
         // that is announced but mute. /dev/null swallows the writes.
         let mut session = session(Link::Up, Some(90), None);
-        session.file = OpenOptions::new().write(true).open("/dev/null").unwrap();
         let now = Instant::now();
 
         for _ in 0..=MAX_UNANSWERED {
@@ -913,24 +948,47 @@ mod tests {
     }
 
     #[test]
-    fn parses_the_ids_out_of_a_uevent() {
-        let uevent = "DRIVER=hid-generic\nHID_ID=0003:00003329:00004B18\n\
-                      HID_NAME=Audeze LLC Audeze Maxwell XBOX Dongle\nHID_PHYS=usb-1/input0\n";
-        assert_eq!(
-            parse_uevent(uevent),
-            Some((
-                BUS_USB,
-                0x3329,
-                0x4b18,
-                "Audeze LLC Audeze Maxwell XBOX Dongle".to_owned()
-            ))
-        );
-        assert_eq!(parse_uevent("DRIVER=hid-generic\n"), None);
-        assert_eq!(parse_uevent("HID_ID=garbage\n"), None);
+    fn a_transfer_that_merely_failed_keeps_the_session() {
+        // The fetch fails on /dev/null (ENOTTY), which is not what an
+        // unplugged dongle answers (ENODEV): the session survives, and with
+        // it the link belief and the questions already asked - a fresh
+        // session would listen, then spend its quick questions again.
+        let dongle = Dongle {
+            node: PathBuf::from("/dev/null"),
+            product: "Audeze Dongle".to_owned(),
+            product_id: 0x4b18,
+        };
+        let now = Instant::now();
+        let mut reader = Reader::new();
+        let mut session = session(Link::Up, Some(90), Some(now));
+        session.asks = 3;
+        reader.sessions.insert(dongle.node.clone(), session);
+
+        let minute = Duration::from_secs(60);
+        let headsets = reader.reconcile(std::slice::from_ref(&dongle), false, now, minute, minute);
+        assert_eq!(headsets.len(), 1);
+        // No level while the failure lasts: the bridge's graces take over.
+        assert_eq!(headsets[0].battery, BatteryState::Unavailable);
+        assert_eq!(headsets[0].product, "Audeze Dongle");
+        let kept = reader
+            .sessions
+            .get(&dongle.node)
+            .expect("the session is kept");
+        assert_eq!((kept.link, kept.level, kept.asks), (Link::Up, Some(90), 3));
+
+        // A node that sysfs no longer lists takes its session with it, and
+        // what it knew of the link is handed to the next one.
+        let headsets = reader.reconcile(&[], false, now, minute, minute);
+        assert_eq!(headsets, []);
+        assert_eq!(reader.sessions.len(), 0);
+        assert_eq!(reader.last_link.get(&0x4b18), Some(&Link::Up));
     }
 
     #[test]
     fn our_own_virtual_battery_is_not_mistaken_for_a_dongle() {
+        // The identity is parsed by hidraw, which has its own tests; what is
+        // checked here is this module's filter: the USB bus, Audeze's vendor
+        // ID, a dongle's product ID.
         let class_dir = tempfile::tempdir().unwrap();
         let dir = class_dir.path();
         for (node, uevent) in [
@@ -944,19 +1002,37 @@ mod tests {
                 "hidraw17",
                 "HID_ID=0006:00003329:00004B18\nHID_NAME=Audeze Maxwell\n",
             ),
+            // Another Audeze device on USB - the headset on a cable, should
+            // it expose a HID interface - is not a dongle.
+            ("hidraw18", "HID_ID=0003:00003329:00004B1E\n"),
             // Somebody else's device.
             (
                 "hidraw2",
                 "HID_ID=0003:00001532:000000A4\nHID_NAME=Razer Dock\n",
             ),
+            // A dongle whose uevent has no name.
+            ("hidraw3", "HID_ID=0003:00003329:00004B19\n"),
         ] {
             fs::create_dir_all(dir.join(node).join("device")).unwrap();
             fs::write(dir.join(node).join("device/uevent"), uevent).unwrap();
         }
 
-        let found = discover(dir);
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].node, Path::new("/dev/hidraw10"));
+        let found = discover_in(dir, Path::new("/dev"));
+        assert_eq!(
+            found,
+            [
+                Dongle {
+                    node: PathBuf::from("/dev/hidraw3"),
+                    product: DEFAULT_PRODUCT.to_owned(),
+                    product_id: 0x4b19,
+                },
+                Dongle {
+                    node: PathBuf::from("/dev/hidraw10"),
+                    product: "Audeze Dongle".to_owned(),
+                    product_id: 0x4b18,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -996,7 +1072,7 @@ mod tests {
     #[test]
     fn discovery_survives_a_missing_sysfs() {
         assert_eq!(
-            discover(Path::new("/nonexistent/hidraw")),
+            discover_in(Path::new("/nonexistent/hidraw"), Path::new("/dev")),
             [] as [Dongle; 0]
         );
     }
