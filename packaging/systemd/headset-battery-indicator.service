@@ -14,6 +14,18 @@ RestartSec=10
 # opens it and passes the descriptor, and the process runs as a throwaway
 # unprivileged user whose only other device is the headset's hidraw node (via
 # the headset-battery group from the udev rule).
+#
+# OpenFile= needs systemd 253 (early 2023). On an older systemd this unit
+# fails to load; the fallback is to let the daemon open the node itself, which
+# means granting the service's group access to it:
+#   - drop the OpenFile= line, and the "DeviceAllow=/dev/uhid rw" line below
+#     then serves the process rather than the manager;
+#   - add a udev rule, e.g. /etc/udev/rules.d/70-uhid.rules:
+#       KERNEL=="uhid", GROUP="headset-battery", MODE="0660"
+#     then `udevadm control --reload && udevadm trigger --name-match=uhid`.
+# ExecStart= stays as it is: with no descriptor passed down the daemon opens
+# --uhid (/dev/uhid) on its own. The price is that every member of that group
+# can create input devices, which is why the shipped unit does not do this.
 OpenFile=/dev/uhid:uhid
 DynamicUser=yes
 SupplementaryGroups=headset-battery

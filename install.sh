@@ -71,8 +71,12 @@ install_all() {
     fi
 
     say "generating $UDEV_RULE"
+    # The generator fails when it finds nothing to read - no dongle plugged in,
+    # and no headsetcontrol to ask either. That is the warning below, not a
+    # reason to leave the unit uninstalled: under `set -e` a bare assignment
+    # from a failing command would end the script right here.
     local rules
-    rules=$("$BIN_DIR/$BIN_NAME" udev-rules --group "$GROUP")
+    rules=$("$BIN_DIR/$BIN_NAME" udev-rules --group "$GROUP") || rules=""
     if printf '%s\n' "$rules" | grep -q '^KERNEL=='; then
         install -d "$UDEV_DIR"
         rm -f "$LEGACY_UDEV_RULE"
