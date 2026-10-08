@@ -14,9 +14,12 @@
 //!
 //! The battery values come from the [HeadsetControl] binary, which knows the
 //! vendor protocol of a few hundred headsets - or, for the Audeze Maxwell, from
-//! a native reader that is markedly more reliable (see [`maxwell`]).
+//! a native reader that is markedly more reliable (see [`maxwell`]). That
+//! reader talks to the dongle through the [hidraw] crate, shared the same way:
+//! this crate knows what the dongle says, not how `/dev/hidrawN` is driven.
 //!
 //! [HeadsetControl]: https://github.com/Sapd/HeadsetControl
+//! [hidraw]: https://github.com/GregDuhamel/hidraw
 //! [uhid-battery]: https://github.com/GregDuhamel/uhid-battery
 
 pub mod bridge;

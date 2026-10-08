@@ -19,22 +19,35 @@ kernel publishes under `/sys/class/power_supply`. So instead of talking to
 UPower, this daemon talks to the kernel:
 
 ```
- native reader: dongle's hidraw        /dev/uhid                    /sys/class/power_supply
- (listens, 1 s)            ─┐   ┌──────────────────────┐    ┌─────────────────────────┐
-                            ├──▶│ headset-battery-     │──▶ │ hid-headset-3329-4b18-  │
- headsetcontrol -b -o json ─┘   │ indicator            │    │ battery  (capacity=73)  │
- (polled, 60 s)                 └──────────────────────┘    └────────────┬────────────┘
-                                 creates a virtual HID                   │ udev
-                                 device whose descriptor                 ▼
-                                 declares a battery              ┌───────────────┐
-                                                                 │    UPower     │
-                                                                 └───────┬───────┘
-                                                                         ▼
-                                                              KDE Power & Battery
+ dongle's /dev/hidrawN ── hidraw ──┐    ┌──────────────────────┐               /sys/class/power_supply
+ (native reader; listens, 1 s)     │    │                      │  uhid-battery ┌─────────────────────────┐
+                                   ├──▶ │ headset-battery-     │──────────────▶│ hid-headset-3329-4b18-  │
+ headsetcontrol -b -o json ────────┘    │ indicator            │  /dev/uhid    │ battery  (capacity=73)  │
+ (polled, 60 s)                         └──────────────────────┘               └────────────┬────────────┘
+                                        creates a virtual HID                               │ udev
+                                        device whose descriptor                             ▼
+                                        declares a battery                          ┌───────────────┐
+                                                                                    │    UPower     │
+                                                                                    └───────┬───────┘
+                                                                                            ▼
+                                                                                   KDE Power & Battery
 ```
 
 The level comes from the native reader for the Audeze Maxwell, and from
 HeadsetControl for everything else (see [Backends](#backends)).
+
+Two crates shared with this account's other daemons do the talking to the
+kernel, and this crate keeps the two protocols - the Maxwell dongle's, and
+HeadsetControl's JSON:
+
+* [hidraw](https://github.com/GregDuhamel/hidraw) reads the dongle: it lists
+  `/sys/class/hidraw` and tells the USB dongle from the virtual battery this
+  daemon publishes under the same IDs, sends the battery request as an output
+  report, fetches the answer with the `HIDIOCGINPUT` ioctl, and tells an
+  unplugged dongle from a transfer that merely failed.
+* [uhid-battery](https://github.com/GregDuhamel/uhid-battery) publishes the
+  level: the virtual HID device on `/dev/uhid`, the descriptor systemd passes
+  down, and the power supply the kernel builds from it.
 
 The virtual device's report descriptor declares *Battery Strength* (Generic
 Device Controls page, usage `0x20`) and *Charging* (Battery System page, usage
@@ -119,13 +132,18 @@ what gets reported as charging. A headset charging from a wall adapter is
 therefore invisible, and keeps reading as discharging.
 
 The answer is only available through a `GET_REPORT` control transfer
-(`HIDIOCGINPUT`); the dongle never pushes it on the interrupt endpoint, so a
-plain `read()` on the hidraw node sees nothing.
+(`HIDIOCGINPUT`, Linux 5.11 and newer); the dongle never pushes it on the
+interrupt endpoint, so a plain `read()` on the hidraw node sees nothing. That
+is `hidraw::Device::get_input`; the request goes out as one output report
+(`Device::write`), and the dongle is told from the virtual battery that
+carries its IDs by the bus `hidraw::discover` reports, USB against virtual.
 
 ## Requirements
 
 * Linux with `CONFIG_UHID` and `CONFIG_HID_BATTERY_STRENGTH` (Fedora, Arch,
-  Ubuntu and friends all ship both).
+  Ubuntu and friends all ship both). The native reader also needs Linux 5.11
+  or newer, which added the `HIDIOCGINPUT` ioctl it reads the dongle's answer
+  with; HeadsetControl has no such requirement.
 * An Audeze Maxwell, **or** [HeadsetControl](https://github.com/Sapd/HeadsetControl)
   4.x on `PATH` with a
   [supported headset](https://github.com/Sapd/HeadsetControl#supported-headsets)
@@ -264,13 +282,17 @@ nobody is granted access to the node:
 * the only other device it reaches is the headset's own `hidraw` node, through
   the `headset-battery` group set by the generated udev rule.
 
-The daemon denies `unsafe` code outside one documented spot, the `HIDIOCGINPUT`
-ioctl of the native reader. Everything to do with `/dev/uhid` - the wire format,
-adopting the descriptor systemd passes, checking that it really is the uhid
-device before writing into it, marking it close-on-exec so the `headsetcontrol`
-child never inherits it - lives in
-[uhid-battery](https://github.com/GregDuhamel/uhid-battery), shared with
-[razerd](https://github.com/GregDuhamel/razerd).
+The daemon denies `unsafe` code outside one documented spot: adopting the
+descriptors systemd passes down, in `main.rs`. That call (uhid-battery's
+`Handle::inherited`) unsets `LISTEN_*` in the environment, which is only sound
+before any thread exists, and the comment there says why it is. Every system
+call lives in the two shared crates: the hidraw ioctls in
+[hidraw](https://github.com/GregDuhamel/hidraw), and everything to do with
+`/dev/uhid` - the wire format, checking that the descriptor really is the uhid
+device before writing into it, marking it close-on-exec so the
+`headsetcontrol` child never inherits it - in
+[uhid-battery](https://github.com/GregDuhamel/uhid-battery). Both are shared
+with [razerd](https://github.com/GregDuhamel/razerd).
 
 ## Development
 
@@ -281,8 +303,11 @@ cargo fmt --all --check
 ```
 
 The CLI tests drive the binary against a stub `headsetcontrol`, so they run
-anywhere. What talks to the real kernel - creating a virtual battery and reading
-it back from sysfs - is tested in
+anywhere. The native reader is tested on frames captured from a real dongle,
+on `/dev/null` standing in for the node, and on a fake sysfs for the dongle
+filter. What talks to the real kernel is tested in the shared crates: reading
+hidraw nodes in [hidraw](https://github.com/GregDuhamel/hidraw), creating a
+virtual battery and reading it back from sysfs in
 [uhid-battery](https://github.com/GregDuhamel/uhid-battery), as root.
 
 CI runs the test suite on stable and on the MSRV, verifies the systemd unit with
@@ -310,8 +335,8 @@ the unit's `ExecStart=`.
 
 **The journal says `no supported headset found`.** The daemon is
 running but cannot see the dongle, which is a different problem from a headset
-that is merely switched off — that one is reported as *"connected but not
-answering battery queries"*. Either the dongle is unplugged, or the udev rule
+that is merely switched off — that one is reported as *"detected but not
+answering battery queries (switched off?)"*. Either the dongle is unplugged, or the udev rule
 does not cover it and the service's unprivileged user cannot open its hidraw
 node. Regenerate the rule while the dongle is plugged in:
 

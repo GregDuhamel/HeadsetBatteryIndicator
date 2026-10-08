@@ -43,7 +43,8 @@ NoNewPrivileges=yes
 PrivateNetwork=yes
 IPAddressDeny=any
 # libudev, which headsetcontrol uses to enumerate hidraw nodes, talks to
-# systemd-udevd over a local socket.
+# systemd-udevd over a local socket. The native reader needs neither: it reads
+# /sys/class/hidraw and /sys/bus/usb/devices directly.
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
 ProtectSystem=strict
 ProtectHome=yes
