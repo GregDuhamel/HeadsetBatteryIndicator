@@ -214,7 +214,7 @@ dependencies = [
 
 [[package]]
 name = "headset-battery-indicator"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -526,8 +526,8 @@ dependencies = [
 
 [[package]]
 name = "uhid-battery"
-version = "0.2.0"
-source = "git+https://github.com/GregDuhamel/uhid-battery?tag=v0.2.0#f7ee7a9d2e5489a9b11530f8848ef80d207776ef"
+version = "0.3.0"
+source = "git+https://github.com/GregDuhamel/uhid-battery?tag=v0.3.0#25c8f8618d397e8242c4d0ba0695288ac801b4b7"
 dependencies = [
  "rustix",
 ]

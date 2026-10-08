@@ -208,6 +208,21 @@ fn init_logging(verbose: u8) {
     builder.init();
 }
 
+/// The `/dev/uhid` descriptors systemd handed us, if any.
+///
+/// `OpenFile=/dev/uhid:uhid` in the unit: systemd opens the node and passes
+/// it down, so the daemon never needs permission to open it itself.
+// `unsafe_code = "deny"` crate-wide; this is the one place that needs it.
+#[allow(unsafe_code)]
+fn inherited_uhid_handles() -> Vec<Handle> {
+    // SAFETY: `inherited` removes `LISTEN_PID`/`LISTEN_FDS`/`LISTEN_FDNAMES`
+    // from the environment, which is only sound while no other thread can be
+    // reading it. It is called from `run` before the bridge starts, and the
+    // only threads this daemon ever spawns (draining headsetcontrol's pipes)
+    // come later.
+    unsafe { Handle::inherited(UHID_FD_PREFIX) }
+}
+
 fn run(args: &RunArgs, source: Source) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
@@ -215,9 +230,7 @@ fn run(args: &RunArgs, source: Source) -> Result<()> {
             .with_context(|| format!("installing the handler for signal {signal}"))?;
     }
 
-    // `OpenFile=/dev/uhid:uhid` in the unit: systemd opens the node and passes
-    // it down, so the daemon never needs permission to open it itself.
-    let inherited = Handle::inherited(UHID_FD_PREFIX);
+    let inherited = inherited_uhid_handles();
 
     let config = Config {
         interval: Duration::from_secs(args.interval.max(1)),
