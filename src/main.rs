@@ -15,6 +15,7 @@ use headset_battery_indicator::bridge::{
 };
 use headset_battery_indicator::headset::BatteryState;
 use headset_battery_indicator::headsetcontrol::HeadsetControl;
+use headset_battery_indicator::notify::Notifier;
 use headset_battery_indicator::source::{Backend, DEFAULT_NATIVE_INTERVAL_SECS, Source};
 use log::{LevelFilter, error};
 use uhid_battery::{DEV_UHID, Handle, Kind, find_power_supply};
@@ -231,6 +232,10 @@ fn run(args: &RunArgs, source: Source) -> Result<()> {
     }
 
     let inherited = inherited_uhid_handles();
+    // `Type=notify` in the unit: the manager waits for READY=1, and
+    // `WatchdogSec=` for the pings. Run by hand there is no socket, and this
+    // does nothing.
+    let notify = Notifier::from_env();
 
     let config = Config {
         interval: Duration::from_secs(args.interval.max(1)),
@@ -239,7 +244,7 @@ fn run(args: &RunArgs, source: Source) -> Result<()> {
         uhid_path: args.uhid.clone(),
     };
 
-    Bridge::new(config, source, inherited).run(&stop)
+    Bridge::new(config, source, inherited).run(&stop, &notify)
 }
 
 fn status(source: &mut Source) -> Result<()> {

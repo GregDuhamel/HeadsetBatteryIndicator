@@ -150,7 +150,8 @@ carries its IDs by the bus `hidraw::discover` reports, USB against virtual.
   that has the `battery` capability.
 * UPower (any desktop that shows peripheral batteries).
 * systemd 253 or newer for the shipped unit, which relies on `OpenFile=` to
-  hand `/dev/uhid` to the service without granting anyone access to the node.
+  hand `/dev/uhid` to the service without granting anyone access to the node
+  (the `Type=notify` watchdog it also uses is far older).
   On an older systemd the unit does not load; the comment above `OpenFile=` in
   `packaging/systemd/headset-battery-indicator.service` describes the fallback
   (a udev rule giving the service's group access to `/dev/uhid`, and an
@@ -222,6 +223,7 @@ dongle says when the headset comes and goes and the daemon listens for it:
 | Dongle unplugged, or a reader failing outright | Withdrawn after `--missing-grace` (30 s). A single warning per failure streak. |
 | Headset silent without the dongle saying why | Withdrawn after `--offline-grace` (10 s), counted from the first lost reading so that a few retries fit in. |
 | Service stopped or restarted | Every virtual battery is destroyed, so no stale entry is left behind. |
+| Daemon hung | The unit is `Type=notify` with `WatchdogSec=60`: the loop pings systemd on every turn, and a loop that stops turning is killed and restarted (`Restart=always`), which destroys the batteries with it. See [The unit](#the-unit). |
 
 Through HeadsetControl there are no announcements: the headset is polled every
 `--interval` (60 s), a reading that goes unanswered is retried every 3 s, and
@@ -267,6 +269,23 @@ Small moves are logged at debug level rather than info, so a headset hovering
 between 91% and 92% does not fill the journal; `journalctl -u
 headset-battery-indicator -f` with `-v` in `ExecStart=` shows everything.
 
+## The unit
+
+`packaging/systemd/headset-battery-indicator.service` is `Type=notify`: the
+daemon tells systemd `READY=1` once its loop is about to start, `WATCHDOG=1`
+on every turn of it, and `STOPPING=1` on the way out, through the
+`sd_notify(3)` protocol spoken directly on `NOTIFY_SOCKET` (`src/notify.rs`,
+`std` only, no `unsafe`, no libsystemd). Run by hand there is no such socket
+and all of that is a no-op.
+
+`WatchdogSec=60` is sized from the loop: a turn is at most one wait on the
+devices (5 s) plus one tick - a HeadsetControl reading, cut off at
+`--timeout` (10 s by default), and the 2 s a new device is given to register
+its power supply - so the pings are never more than 17 s apart, and 60 s is
+over three times that. A daemon that stops turning is killed and restarted by
+`Restart=always`; the kernel takes the virtual batteries down with the
+process, so no stale entry survives it.
+
 ## Security
 
 `/dev/uhid` is what this daemon needs, and a process holding it can create
@@ -283,7 +302,8 @@ nobody is granted access to the node:
   the `headset-battery` group set by the generated udev rule.
 
 The daemon denies `unsafe` code outside one documented spot: adopting the
-descriptors systemd passes down, in `main.rs`. That call (uhid-battery's
+descriptors systemd passes down, in `main.rs`. (The `sd_notify` side of the
+systemd protocol needs none: it is a datagram on a socket.) That call (uhid-battery's
 `Handle::inherited`) unsets `LISTEN_*` in the environment, which is only sound
 before any thread exists, and the comment there says why it is. Every system
 call lives in the two shared crates: the hidraw ioctls in
@@ -309,6 +329,44 @@ filter. What talks to the real kernel is tested in the shared crates: reading
 hidraw nodes in [hidraw](https://github.com/GregDuhamel/hidraw), creating a
 virtual battery and reading it back from sysfs in
 [uhid-battery](https://github.com/GregDuhamel/uhid-battery), as root.
+
+### How the core is tested
+
+The daemon's loop (`src/bridge.rs`) has two seams, and only two:
+
+* `BatterySource` is where readings come from - `Source` in the daemon, a
+  scripted list of polls in the tests;
+* `Uhid` is where virtual devices go - `DevicePool` over `/dev/uhid` in the
+  daemon, and in the tests a fake kernel: uhid-battery's own test stand-in,
+  a datagram socket pair per device, made public by its `fake` feature
+  (enabled from the dev-dependencies only). The trait covers just what a
+  socket cannot do - hand out a descriptor on the real node, and list a
+  power supply under sysfs.
+
+Everything between the seams is the real thing: the real `Battery` writing
+real uhid events into the socket, `serve_all` answering the fake kernel's
+`GET_REPORT`, and the bridge's bookkeeping around them. The tests read the
+events back and check them - the level pushed, the device destroyed - and
+they pass the clock in (`tick(now)`), so a minute of republishing or thirty
+seconds of grace cost nothing. Covered that way: the first reading creating
+the device and the republish every 60 s, the 3 s a "headset gone" has to
+hold, the retry a minute later when the kernel builds no power supply, a
+charging headset with no level keeping the last one, the second opinion a
+large jump needs (and a cached reading not counting as one), the offline and
+missing graces, three failed services or pushes destroying the device and the
+attach path bringing it back, an identity the kernel can never accept being
+given up on once, every battery withdrawn at shutdown with `READY=1` and
+`STOPPING=1` on the way, and `sd_notify` itself on a socket of its own.
+
+What the fake kernel cannot do is fail the way uhid does: a socket whose
+other end is gone refuses one write and then reads as empty, where a broken
+uhid device fails every time, so the three strikes of one `serve_all` call
+are collected over a service and two pushes instead. The `Session` of the
+native reader keeps `hidraw::Device` concrete, with `/dev/null` and
+`/dev/zero` standing in for the dongle's node: what the dongle *says* is
+tested on captured frames through `Session::take_in`, and the session's
+lifetime across the dongle's re-enumeration through `Reader::reconcile`;
+injecting the `HIDIOCGINPUT` answer itself is not.
 
 CI runs the test suite on stable and on the MSRV, verifies the systemd unit with
 `systemd-analyze`, and the lint workflow covers rustfmt, clippy, rustdoc,

@@ -1,6 +1,6 @@
 [package]
 name = "headset-battery-indicator"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Publishes a wireless headset's battery level to UPower - natively for the Audeze Maxwell, through HeadsetControl otherwise - so it shows up in KDE's Power & Battery"
@@ -25,13 +25,23 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # The virtual HID battery: /dev/uhid, the descriptor systemd passes down, and
 # the power supply the kernel builds from it. Not on crates.io either.
-uhid-battery = { git = "https://github.com/GregDuhamel/uhid-battery", tag = "v0.4.0" }
+#
+# TEMPORARY: a path to the local checkout (branch `fake-feature`) until
+# uhid-battery v0.4.1 brings the `fake` feature the unit tests use (a datagram
+# socket standing in for /dev/uhid).
+uhid-battery = { git = "https://github.com/GregDuhamel/uhid-battery", tag = "v0.4.1" }
 signal-hook = { version = "0.4", default-features = false }
 
 [dev-dependencies]
 # Scratch directories standing in for sysfs (the hidraw class and the USB bus),
 # removed when the test is done.
 tempfile = "3"
+# The fake kernel behind the bridge's unit tests: a datagram socket pair
+# standing in for /dev/uhid, so the real `Battery` is driven end to end -
+# create, push, answer the kernel, destroy - without the node or root. The
+# feature is for tests only, which is why it is enabled from here and not from
+# the dependency above. Same TEMPORARY path as above.
+uhid-battery = { git = "https://github.com/GregDuhamel/uhid-battery", tag = "v0.4.1", features = ["fake"] }
 
 [lints.rust]
 missing_docs = "warn"

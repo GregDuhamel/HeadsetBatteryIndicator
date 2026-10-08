@@ -4,7 +4,17 @@ Documentation=https://github.com/GregDuhamel/HeadsetBatteryIndicator
 After=systemd-udevd.service
 
 [Service]
-Type=simple
+# The daemon speaks sd_notify(3) on its own (no libsystemd): READY=1 once its
+# loop is about to start, WATCHDOG=1 on every turn of it, STOPPING=1 on the
+# way out. A turn is at most one wait (5 s) plus one tick - a headsetcontrol
+# reading, cut off at --timeout (10 s), and the 2 s a device is given to
+# register - so the pings are never more than 17 s apart; 60 s is over three
+# times that, so a machine that is merely slow is not restarted, while a loop
+# that hangs is, through Restart= below. systemd's notification socket is a
+# filesystem path, which PrivateNetwork= does not get in the way of, and
+# AF_UNIX is in RestrictAddressFamilies= for libudev already.
+Type=notify
+WatchdogSec=60
 ExecStart=/usr/local/bin/headset-battery-indicator run --interval 60
 Restart=always
 RestartSec=10

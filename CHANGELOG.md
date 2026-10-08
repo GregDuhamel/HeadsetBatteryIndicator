@@ -5,6 +5,52 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-10-09
+
+The daemon's loop is now tested end to end without hardware or `/dev/uhid`,
+and the unit has a watchdog.
+
+### Added
+
+- A systemd watchdog: the unit is `Type=notify` with `WatchdogSec=60`, and
+  the daemon speaks `sd_notify(3)` itself (`src/notify.rs`: `READY=1`,
+  `WATCHDOG=1` on every turn of the loop, `STOPPING=1`; `std` only, no
+  `unsafe`, abstract socket names handled). Without `NOTIFY_SOCKET` it is
+  all a no-op. The README's new *The unit* section sizes the 60 s.
+- Unit tests of the bridge itself, over a scripted source and uhid-battery's
+  fake kernel (its new `fake` feature, from the dev-dependencies): attach on
+  the first reading and republish every minute, the disconnect settle, the
+  attach retry after a minute, charging without a level, the deferred
+  reading and its second opinion, the offline and missing graces, the
+  three-strikes destruction and the attach path after it, an identity the
+  kernel can never accept, and the withdrawal of every battery at shutdown.
+  The clock is passed in, so none of them sleeps. The README's *How the
+  core is tested* section says what is and is not covered.
+- Tests of the native reader's access-error reporting (said once, after
+  5 s, and the recovery once too), of the headset going away as the dongle
+  reports it, and of a re-enumerating dongle handing its link belief to the
+  new session.
+
+### Changed
+
+- `Bridge` is generic over a `BatterySource` (implemented by `Source`) and
+  a `Uhid` (implemented by `DevicePool`): the two seams the tests go
+  through. `Bridge::run` takes the `Notifier`, and `tick` the instant of the
+  poll.
+- The native reader's access-error bookkeeping is an `AccessWatch` apart
+  from the logging, so that it can be tested with instants of the test's
+  choosing. Same lines in the journal.
+- uhid-battery is pinned to the release that carries the `fake` feature.
+
+### Fixed
+
+- A headset that was no longer reported at all - the dongle unplugged, or a
+  reader failing - was withdrawn after the *offline* grace (10 s), not the
+  *missing* grace (30 s) the README promised: a missing headset is a silent
+  one too, and the shorter grace was judged first. The missing grace is now
+  judged on its own, and the offline grace only applies to a headset that
+  is still listed.
+
 ## [0.3.0] - 2026-10-08
 
 The native reader's transport moved to the shared
@@ -104,6 +150,7 @@ Review fixes of the first phase.
 notes are on the
 [GitHub releases page](https://github.com/GregDuhamel/HeadsetBatteryIndicator/releases).
 
+[0.4.0]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.2.0...v0.2.1
