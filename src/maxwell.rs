@@ -995,6 +995,9 @@ mod tests {
 
     #[test]
     fn discovery_survives_a_missing_sysfs() {
-        assert!(discover(Path::new("/nonexistent/hidraw")).is_empty());
+        assert_eq!(
+            discover(Path::new("/nonexistent/hidraw")),
+            [] as [Dongle; 0]
+        );
     }
 }

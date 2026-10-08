@@ -308,9 +308,9 @@ mod tests {
     #[test]
     fn tolerates_a_text_preamble_and_an_empty_document() {
         let json = "No config file found\n{\"devices\":[]}";
-        assert!(parse(json).unwrap().is_empty());
-        assert!(parse("").unwrap().is_empty());
-        assert!(parse("   \n").unwrap().is_empty());
+        assert_eq!(parse(json).unwrap(), [] as [Headset; 0]);
+        assert_eq!(parse("").unwrap(), [] as [Headset; 0]);
+        assert_eq!(parse("   \n").unwrap(), [] as [Headset; 0]);
     }
 
     #[test]
