@@ -19,19 +19,22 @@ kernel publishes under `/sys/class/power_supply`. So instead of talking to
 UPower, this daemon talks to the kernel:
 
 ```
- headsetcontrol -b -o json          /dev/uhid                    /sys/class/power_supply
- ┌───────────────────────┐   poll   ┌──────────────────────┐    ┌─────────────────────────┐
- │  Audeze Maxwell 73 %  │ ───────▶ │ headset-battery-     │──▶ │ hid-headset-3329-4b18-  │
- │  (vendor HID report)  │   60 s   │ indicator            │    │ battery  (capacity=73)  │
- └───────────────────────┘          └──────────────────────┘    └────────────┬────────────┘
-                                     creates a virtual HID                   │ udev
-                                     device whose descriptor                 ▼
-                                     declares a battery              ┌───────────────┐
-                                                                     │    UPower     │
-                                                                     └───────┬───────┘
-                                                                             ▼
-                                                                  KDE Power & Battery
+ native reader: dongle's hidraw        /dev/uhid                    /sys/class/power_supply
+ (listens, 1 s)            ─┐   ┌──────────────────────┐    ┌─────────────────────────┐
+                            ├──▶│ headset-battery-     │──▶ │ hid-headset-3329-4b18-  │
+ headsetcontrol -b -o json ─┘   │ indicator            │    │ battery  (capacity=73)  │
+ (polled, 60 s)                 └──────────────────────┘    └────────────┬────────────┘
+                                 creates a virtual HID                   │ udev
+                                 device whose descriptor                 ▼
+                                 declares a battery              ┌───────────────┐
+                                                                 │    UPower     │
+                                                                 └───────┬───────┘
+                                                                         ▼
+                                                              KDE Power & Battery
 ```
+
+The level comes from the native reader for the Audeze Maxwell, and from
+HeadsetControl for everything else (see [Backends](#backends)).
 
 The virtual device's report descriptor declares *Battery Strength* (Generic
 Device Controls page, usage `0x20`) and *Charging* (Battery System page, usage
@@ -128,6 +131,12 @@ plain `read()` on the hidraw node sees nothing.
   [supported headset](https://github.com/Sapd/HeadsetControl#supported-headsets)
   that has the `battery` capability.
 * UPower (any desktop that shows peripheral batteries).
+* systemd 253 or newer for the shipped unit, which relies on `OpenFile=` to
+  hand `/dev/uhid` to the service without granting anyone access to the node.
+  On an older systemd the unit does not load; the comment above `OpenFile=` in
+  `packaging/systemd/headset-battery-indicator.service` describes the fallback
+  (a udev rule giving the service's group access to `/dev/uhid`, and an
+  `ExecStart=` that opens it itself).
 * Rust 1.85 or newer to build.
 
 ## Install
@@ -156,14 +165,18 @@ upower -d | grep -B2 -A8 -i headset
 headset-battery-indicator [OPTIONS] [COMMAND]
 
 Commands:
-  run         Run the daemon (default)
-  status      Print what HeadsetControl currently reports, then exit
+  run         Run the daemon (the default, with its default options)
+  status      Print what the readers currently report, then exit
   udev-rules  Print a udev rule granting a group access to the detected headsets
 
 Options:
       --backend <BACKEND>      auto, native or headsetcontrol [default: auto]
       --headsetcontrol <PATH>  Path to the headsetcontrol binary [default: headsetcontrol]
       --timeout <SECONDS>      How long to wait for headsetcontrol [default: 10]
+  -v, --verbose...             -v for debug, -vv for trace
+
+headset-battery-indicator run [OPTIONS]
+
   -i, --interval <SECONDS>     Delay between two readings through headsetcontrol [default: 60]
       --native-interval <SECONDS>
                                How often the native reader asks a linked headset for its level [default: 60]
@@ -172,10 +185,12 @@ Options:
       --missing-grace <SECONDS>
                                How long an undetected headset keeps its entry [default: 30]
       --uhid <PATH>            Path of the uhid character device [default: /dev/uhid]
-  -v, --verbose...             -v for debug, -vv for trace
 ```
 
-`RUST_LOG` is honoured too, if you want finer filtering than `-v`.
+The daemon's options belong to `run`: `headset-battery-indicator run
+--interval 30`. Given with another command they are refused rather than
+silently ignored. `RUST_LOG` is honoured too, if you want finer filtering than
+`-v`.
 
 ## When the headset is not there
 
@@ -209,7 +224,10 @@ the dongle itself, and only unplugging it brought it back. Requests for an
 absent headset most likely pile up in the dongle; whatever the cause, not
 sending them is the cure. As a second line of defence the reader stops asking
 when a headset that is announced as linked leaves three requests unanswered,
-and says so in the journal.
+and says so in the journal. Stops, not for good: a session that has heard
+nothing is asked again every ten minutes - six requests an hour, a hundredth
+of what wedged the dongle - so a headset that came back unannounced, or was
+wrongly given up on, is still found.
 
 The dongle also re-enumerates on USB a second or two after every link change,
 so its hidraw node vanishes and comes back. The daemon reopens it, carries what

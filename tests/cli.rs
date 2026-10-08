@@ -155,6 +155,78 @@ fn garbage_output_is_reported_with_context() {
 }
 
 #[test]
+fn what_headsetcontrol_said_on_stderr_is_quoted() {
+    // The explanation of a failure - a missing library, a device that is not
+    // there - is on stderr; an error that only quoted stdout left it out.
+    let stub = stub(
+        "stderr",
+        "#!/bin/sh\necho 'not json' \necho 'libhidapi: device not found' >&2\n",
+    );
+    let output = bin()
+        .arg("--headsetcontrol")
+        .arg(&stub.path)
+        .arg("status")
+        .output()
+        .expect("running the binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unexpected output"), "{stderr}");
+    assert!(stderr.contains("libhidapi: device not found"), "{stderr}");
+}
+
+#[test]
+fn a_talkative_headsetcontrol_does_not_deadlock() {
+    // A pipe holds 64 KiB. A child that writes more blocks until somebody
+    // reads, and a parent that waits for the exit before reading waits for
+    // ever - until its timeout, which then read as "did not answer".
+    let payload = fs::read_to_string("tests/fixtures/maxwell-discharging.json").expect("fixture");
+    let stub = stub(
+        "talkative",
+        &format!(
+            "#!/bin/sh\nhead -c 262144 /dev/zero | tr '\\0' x >&2\ncat <<'JSON'\n{payload}\nJSON\n"
+        ),
+    );
+    let output = bin()
+        .arg("--headsetcontrol")
+        .arg(&stub.path)
+        .args(["--timeout", "5", "status"])
+        .output()
+        .expect("running the binary");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("battery: 73%"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn run_options_are_refused_with_another_command() {
+    // `--interval 30 status` used to parse, with the 30 going nowhere.
+    let _serialised = serialise();
+    for args in [
+        &["--interval", "30", "status"][..],
+        &["status", "--interval", "30"],
+        &["--uhid", "/dev/null", "udev-rules"],
+    ] {
+        let output = bin().args(args).output().expect("running the binary");
+        assert!(!output.status.success(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("unexpected argument"), "{args:?}: {stderr}");
+    }
+
+    // Under `run` they are fine - `--help` keeps the daemon from starting.
+    let output = bin()
+        .args(["run", "--interval", "30", "--help"])
+        .output()
+        .expect("running the binary");
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--interval"));
+}
+
+#[test]
 fn a_hanging_headsetcontrol_is_killed() {
     let stub = stub("hang", "#!/bin/sh\nsleep 30\n");
     let started = std::time::Instant::now();

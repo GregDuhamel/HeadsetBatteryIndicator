@@ -22,11 +22,21 @@ pub const DEFAULT_INTERVAL_SECS: u64 = 60;
 const NATIVE_TICK: Duration = Duration::from_secs(1);
 
 /// How long to wait before trying again to create a virtual battery that could
-/// not be created. The native reader comes round every second; without this a
-/// lasting failure - no uhid descriptor left, a kernel without HID battery
-/// support - would create and destroy a device, and log an error, every second
-/// for as long as it lasts.
+/// not be created, or that was given up on (see [`DEVICE_FAILURE_LIMIT`]). The
+/// native reader comes round every second; without this a lasting failure -
+/// no uhid descriptor left, a kernel without HID battery support - would
+/// create and destroy a device, and log an error, every second for as long as
+/// it lasts.
 const ATTACH_RETRY: Duration = Duration::from_secs(60);
+
+/// How many times in a row talking to a virtual device - pushing a level, or
+/// answering the kernel - may fail before the device is destroyed and created
+/// afresh, through the attach path and its retry. One failure can be the
+/// kernel still probing the device; a streak means the device is broken, and
+/// an error that is never acted on would otherwise be logged on every tick
+/// for ever. Three, so that a transient failure never costs a recreation,
+/// while a lasting one is acted on within a few seconds.
+const DEVICE_FAILURE_LIMIT: u32 = 3;
 
 /// How long the dongle has to keep saying the headset is gone before it is
 /// believed. The link drops for a second while a freshly powered headset
@@ -86,7 +96,7 @@ const LOG_STEP: u8 = 5;
 /// when it cannot see the dongle at all, which are very different problems.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Summary {
-    /// HeadsetControl found no supported device.
+    /// No reader found a supported device.
     NoDevice,
     /// Devices were found, but none of them reports a battery.
     NoBattery,
@@ -148,7 +158,7 @@ enum Withdrawal {
     Keep,
     /// The headset is still detected but has not answered in a long time.
     Silent,
-    /// HeadsetControl no longer reports the headset at all.
+    /// No reader reports the headset at all any more.
     Missing,
 }
 
@@ -267,6 +277,8 @@ struct VirtualBattery {
     logged_percent: u8,
     /// When a reading was last pushed to the kernel.
     published_at: Instant,
+    /// How many times in a row the device could not be talked to.
+    failures: u32,
 }
 
 impl VirtualBattery {
@@ -331,7 +343,7 @@ impl DevicePool {
     }
 }
 
-/// The bridge between HeadsetControl and UPower.
+/// The bridge between the battery readers and UPower.
 #[derive(Debug)]
 pub struct Bridge {
     config: Config,
@@ -378,7 +390,7 @@ impl Bridge {
         );
 
         while !stop.load(Ordering::Relaxed) {
-            let unanswered = self.tick();
+            let unanswered = self.tick(stop);
             let delay = next_delay(
                 unanswered,
                 self.source.last_probe_was_native(),
@@ -402,8 +414,8 @@ impl Bridge {
     ///
     /// Returns whether a published battery went unanswered, which calls for a
     /// prompt retry rather than the usual wait.
-    fn tick(&mut self) -> bool {
-        let headsets = match self.source.probe() {
+    fn tick(&mut self, stop: &AtomicBool) -> bool {
+        let headsets = match self.source.probe(stop) {
             Ok(headsets) => {
                 if self.probe_failing {
                     info!("battery readings are back");
@@ -411,6 +423,11 @@ impl Bridge {
                 }
                 self.announce(Summary::of(&headsets), &headsets);
                 headsets
+            }
+            Err(err) if stop.load(Ordering::Relaxed) => {
+                // A reading cut short by the shutdown is not a failure.
+                debug!("{err:#}");
+                Vec::new()
             }
             Err(err) => {
                 // Only shout about the first failure of a streak: a dongle that
@@ -597,7 +614,50 @@ impl Bridge {
             }
         }
         battery.published_at = now;
-        battery.publish(percent, charging)
+        let pushed = battery.publish(percent, charging);
+        self.outcome(index, pushed, now);
+        Ok(())
+    }
+
+    /// Takes in the result of talking to the virtual device at `index`, and
+    /// says whether the battery is still there.
+    ///
+    /// A failure is logged once per streak, at error level, and then kept
+    /// quiet; after [`DEVICE_FAILURE_LIMIT`] in a row the device is destroyed,
+    /// its handle kept, and the headset goes back through the attach path
+    /// after [`ATTACH_RETRY`], like one whose device could not be created.
+    fn outcome(&mut self, index: usize, result: Result<()>, now: Instant) -> bool {
+        let battery = &mut self.batteries[index];
+        let err = match result {
+            Ok(()) => {
+                if battery.failures > 0 {
+                    info!("{}: its virtual device answers again", battery.name);
+                    battery.failures = 0;
+                }
+                return true;
+            }
+            Err(err) => err,
+        };
+
+        battery.failures += 1;
+        if battery.failures == 1 {
+            error!("{err:#}");
+        } else {
+            debug!("still failing ({} in a row): {err:#}", battery.failures);
+        }
+        if battery.failures < DEVICE_FAILURE_LIMIT {
+            return true;
+        }
+
+        let battery = self.batteries.remove(index);
+        warn!(
+            "{}: {DEVICE_FAILURE_LIMIT} failures in a row, destroying its virtual device; \
+             creating it again in {ATTACH_RETRY:?}",
+            battery.name
+        );
+        self.attach_retry_at.insert(battery.key, now + ATTACH_RETRY);
+        self.pool.release(battery.device);
+        false
     }
 
     /// Registers a new virtual battery with the kernel.
@@ -665,6 +725,7 @@ impl Bridge {
             deferred_sample: None,
             logged_percent: percent,
             published_at: now,
+            failures: 0,
         });
         Ok(())
     }
@@ -727,9 +788,14 @@ impl Bridge {
 
         // Servicing is a non-blocking read, so there is no point in working
         // out which descriptor was ready - and a due push needs it regardless.
-        for battery in &mut self.batteries {
-            if let Err(err) = battery.service() {
-                error!("{err:#}");
+        // A device that fails is given up on by `outcome`, which also stops
+        // a broken descriptor from waking `poll()` again and again for ever.
+        let now = Instant::now();
+        let mut index = 0;
+        while index < self.batteries.len() {
+            let serviced = self.batteries[index].service();
+            if self.outcome(index, serviced, now) {
+                index += 1;
             }
         }
         Ok(())

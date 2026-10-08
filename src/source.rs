@@ -5,7 +5,7 @@
 //! is far more reliable, and it listens to the dongle instead of polling the
 //! headset, which is both quicker to notice a change and kinder to the dongle.
 
-use std::cell::{Cell, RefCell};
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -41,13 +41,13 @@ pub struct Source {
     backend: Backend,
     control: HeadsetControl,
     /// Whether the last probe was answered by the native reader.
-    native: Cell<bool>,
+    native: bool,
     /// The native reader keeps its dongles open between polls.
-    reader: RefCell<maxwell::Reader>,
+    reader: maxwell::Reader,
     /// How often the native reader asks a linked headset for its level.
     native_interval: Duration,
     /// When the native reader last had a dongle to listen to.
-    native_seen_at: Cell<Option<Instant>>,
+    native_seen_at: Option<Instant>,
 }
 
 impl Source {
@@ -57,10 +57,10 @@ impl Source {
         Self {
             backend,
             control,
-            native: Cell::new(false),
-            reader: RefCell::new(maxwell::Reader::new()),
+            native: false,
+            reader: maxwell::Reader::new(),
             native_interval,
-            native_seen_at: Cell::new(None),
+            native_seen_at: None,
         }
     }
 
@@ -92,14 +92,13 @@ impl Source {
     /// coming back goes unnoticed for a minute.
     fn dongle_is_coming_back(&self) -> bool {
         self.native_seen_at
-            .get()
             .is_some_and(|at| at.elapsed() < REENUMERATION_GRACE)
     }
 
     /// One pass of the native reader: listen to the dongles, and ask a linked
     /// headset for its level if that is due.
-    fn listen(&self) -> Vec<Headset> {
-        self.reader.borrow_mut().poll(self.native_interval)
+    fn listen(&mut self) -> Vec<Headset> {
+        self.reader.poll(self.native_interval)
     }
 
     /// A one-shot reading for the `status` command, which cannot wait for the
@@ -108,13 +107,15 @@ impl Source {
     /// # Errors
     ///
     /// Same as [`Source::probe`].
-    pub fn probe_once(&self) -> Result<Vec<Headset>> {
+    pub fn probe_once(&mut self) -> Result<Vec<Headset>> {
+        // Nothing to interrupt a one-shot command with.
+        let stop = AtomicBool::new(false);
         if self.backend == Backend::HeadsetControl {
-            return self.control.probe();
+            return self.control.probe(&stop);
         }
-        let native = self.reader.borrow_mut().read_once();
+        let native = self.reader.read_once();
         if native.is_empty() && self.backend == Backend::Auto {
-            self.control.probe()
+            self.control.probe(&stop)
         } else {
             Ok(native)
         }
@@ -127,31 +128,34 @@ impl Source {
     /// over 2.7 s.
     #[must_use]
     pub fn last_probe_was_native(&self) -> bool {
-        self.native.get()
+        self.native
     }
 
     /// Reads the battery state of every headset this source can see.
+    ///
+    /// `stop` cuts a running `headsetcontrol` short; the native reader never
+    /// waits for anything.
     ///
     /// # Errors
     ///
     /// Only HeadsetControl can fail; the native reader reports a dongle it
     /// cannot query as an unavailable battery instead.
-    pub fn probe(&self) -> Result<Vec<Headset>> {
-        self.native.set(self.backend == Backend::Native);
+    pub fn probe(&mut self, stop: &AtomicBool) -> Result<Vec<Headset>> {
+        self.native = self.backend == Backend::Native;
         match self.backend {
             Backend::Native => Ok(self.listen()),
-            Backend::HeadsetControl => self.control.probe(),
+            Backend::HeadsetControl => self.control.probe(stop),
             Backend::Auto => {
                 let native = self.listen();
                 if native.is_empty() && self.dongle_is_coming_back() {
                     // Still the native reader's turn: see below.
-                    self.native.set(true);
+                    self.native = true;
                     Ok(native)
                 } else if native.is_empty() {
-                    self.control.probe()
+                    self.control.probe(stop)
                 } else {
-                    self.native_seen_at.set(Some(Instant::now()));
-                    self.native.set(true);
+                    self.native_seen_at = Some(Instant::now());
+                    self.native = true;
                     // Deliberately not merged with HeadsetControl's view:
                     // running its twenty-packet sequence against the same
                     // dongle every poll is what we are trying to get away from.

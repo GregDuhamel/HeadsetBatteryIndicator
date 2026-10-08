@@ -42,7 +42,10 @@
 //! power cycle brought it back. The likeliest explanation is that requests for
 //! an absent headset pile up in the dongle; whatever the cause, not sending
 //! them is the cure. As a second line of defence the reader stops asking when
-//! a headset that is supposed to be linked stops answering.
+//! a headset that is supposed to be linked stops answering. Stops, not for
+//! ever: a session that has heard nothing is asked again every ten minutes,
+//! which is a hundredth of the pace that wedged the dongle, so a headset that
+//! came back unannounced is still found.
 //!
 //! The dongle also re-enumerates on USB a second or two after every link
 //! change, so its hidraw node vanishes and comes back; the reader reopens it.
@@ -130,10 +133,22 @@ const LISTEN_FIRST: Duration = Duration::from_secs(3);
 /// How long to wait before asking again a session that has heard nothing, one
 /// entry per extra question. A single request does get lost now and then, and
 /// a lone question would leave a headset that is on unnoticed until it is
-/// switched off and on again. Three questions per session is the ceiling: the
-/// dongle re-enumerates whenever the headset comes or goes, which opens a new
-/// session, so a session still silent after these has nobody behind it.
+/// switched off and on again. Three quick questions per session is the
+/// ceiling: the dongle re-enumerates whenever the headset comes or goes, which
+/// opens a new session, so a session still silent after these most likely has
+/// nobody behind it - and gets the slow cadence below.
 const ASK_AGAIN_AFTER: [Duration; 2] = [Duration::from_secs(10), Duration::from_secs(30)];
+
+/// Once the quick questions are spent, how long between further ones to a
+/// session that has heard nothing. Without any, a headset whose link event was
+/// missed - or that was given up on as mute - stayed unlisted until the dongle
+/// next said something, which can be never. Ten minutes is six requests an
+/// hour, against the three hundred and more that wedged the dongle.
+const ASK_IDLE_RETRY: Duration = Duration::from_secs(600);
+
+// Giving up on a mute headset relies on the quick questions being spent by
+// then, so that the slow cadence applies: see `Session::ask`.
+const _: () = assert!(MAX_UNANSWERED as usize > ASK_AGAIN_AFTER.len());
 
 /// How long an access error has to last before it is worth a warning. Right
 /// after the dongle re-enumerates its new node exists for a moment without the
@@ -243,8 +258,9 @@ struct Session {
     product_id: u16,
     link: Link,
     level: Option<u8>,
-    /// How many battery messages this session has received.
-    readings: u64,
+    /// Which of the reader's battery messages `level` came from (see
+    /// [`Reader::readings`]); zero before the first.
+    sample: u64,
     opened_at: Instant,
     /// When a battery request was last sent, and how many were in this session.
     asked_at: Option<Instant>,
@@ -270,7 +286,7 @@ impl Session {
             product_id: dongle.product_id,
             link,
             level: None,
-            readings: 0,
+            sample: 0,
             opened_at: Instant::now(),
             asked_at: None,
             asks: 0,
@@ -279,10 +295,17 @@ impl Session {
         })
     }
 
-    /// Fetches the report and takes in whatever it says.
-    fn listen(&mut self) -> io::Result<()> {
+    /// Fetches the report and takes in whatever it says. `readings` is the
+    /// reader's count of battery messages, which every level is numbered by.
+    fn listen(&mut self, readings: &mut u64) -> io::Result<()> {
         let frame = get_input_report(&self.file)?;
-        for message in messages(&frame) {
+        self.take_in(&frame, readings);
+        Ok(())
+    }
+
+    /// Takes in what a report says.
+    fn take_in(&mut self, frame: &[u8], readings: &mut u64) {
+        for message in messages(frame) {
             match message {
                 Message::Link(true) => {
                     if self.link != Link::Up {
@@ -304,32 +327,37 @@ impl Session {
                     trace!("battery: {level}%");
                     self.link = Link::Up;
                     self.level = Some(level);
-                    self.readings += 1;
+                    *readings += 1;
+                    self.sample = *readings;
                     self.pending = false;
                     self.unanswered = 0;
                 }
             }
         }
-        Ok(())
     }
 
     /// Whether a battery request is due: regularly while the headset is linked,
-    /// and otherwise a strictly bounded number of times per session.
+    /// and otherwise a few quick questions per session, then slow ones.
     fn should_ask(&self, now: Instant, interval: Duration, listen_first: Duration) -> bool {
         match self.link {
             Link::Up => self
                 .asked_at
                 .is_none_or(|at| now.duration_since(at) >= interval),
-            // A few times per session at most, the first after having listened
-            // for a while. Requests sent to nobody are what this reader exists to
-            // avoid, so there is a hard ceiling rather than a slow retry.
+            // The first question after having listened for a while, a couple
+            // more shortly after, then one every `ASK_IDLE_RETRY`. Requests
+            // sent to nobody are what this reader exists to avoid, hence the
+            // quick ones are few and the slow ones are slow.
             Link::Unknown => match (self.asked_at, self.asks) {
                 (None, _) => now.duration_since(self.opened_at) >= listen_first,
-                (Some(at), asks) => asks
-                    .checked_sub(1)
-                    .and_then(|extra| usize::try_from(extra).ok())
-                    .and_then(|index| ASK_AGAIN_AFTER.get(index))
-                    .is_some_and(|delay| now.duration_since(at) >= *delay),
+                (Some(at), asks) => {
+                    let delay = asks
+                        .checked_sub(1)
+                        .and_then(|extra| usize::try_from(extra).ok())
+                        .and_then(|index| ASK_AGAIN_AFTER.get(index))
+                        .copied()
+                        .unwrap_or(ASK_IDLE_RETRY);
+                    now.duration_since(at) >= delay
+                }
             },
             // The dongle said the headset is gone - possibly to the previous
             // session, this belief being inherited. One question, in case the
@@ -346,10 +374,13 @@ impl Session {
             self.unanswered += 1;
         }
         if self.link == Link::Up && self.unanswered >= MAX_UNANSWERED {
+            // Each of those requests counted as an ask, so the quick questions
+            // of `ASK_AGAIN_AFTER` are spent and only the slow cadence is left.
             warn!(
                 "the headset is reported linked but left {MAX_UNANSWERED} battery requests \
-                 unanswered; not asking again until the dongle says something. If this \
-                 persists while the headset works, power-cycle the dongle"
+                 unanswered; asking again every {ASK_IDLE_RETRY:?} at most, or when the \
+                 dongle says something. If this persists while the headset works, \
+                 power-cycle the dongle"
             );
             self.link = Link::Unknown;
             self.level = None;
@@ -385,6 +416,12 @@ pub struct Reader {
     /// What the last session on each dongle (by product ID) knew of the link,
     /// handed to the session that replaces it.
     last_link: BTreeMap<u16, Link>,
+    /// How many battery messages have been received, over every session. It
+    /// numbers the readings handed out as [`Headset::sample`], and is kept
+    /// here rather than per session so that the numbering survives the
+    /// dongle's re-enumerations: a counter restarting at zero made a reading
+    /// from the new session look like the previous session's first one.
+    readings: u64,
 }
 
 impl Reader {
@@ -495,11 +532,11 @@ impl Reader {
             .get_mut(&dongle.node)
             .expect("the session was just inserted");
 
-        session.listen()?;
+        session.listen(&mut self.readings)?;
         if session.should_ask(now, interval, listen_first) {
             session.ask(now)?;
         }
-        Ok((session.battery(wired), session.readings))
+        Ok((session.battery(wired), session.sample))
     }
 }
 
@@ -732,7 +769,7 @@ mod tests {
             product_id: 0x4b18,
             link,
             level,
-            readings: u64::from(level.is_some()),
+            sample: u64::from(level.is_some()),
             opened_at: Instant::now(),
             asked_at: asked,
             asks: u32::from(asked.is_some()),
@@ -773,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn a_silent_dongle_is_asked_a_few_times_and_never_again() {
+    fn a_silent_dongle_is_asked_a_few_times_quickly_then_slowly() {
         let now = Instant::now();
         let minute = Duration::from_secs(60);
         let ago = |seconds| now.checked_sub(Duration::from_secs(seconds));
@@ -792,12 +829,23 @@ mod tests {
         asked_twice.asks = 2;
         assert!(asked_twice.should_ask(now, minute, Duration::ZERO));
 
-        // ...and then it stops, however long the silence lasts: a request every
-        // ten seconds to a headset that was off is what wedged the dongle.
-        let mut asked_out = session(Link::Unknown, None, ago(86_400));
+        // ...and then only every ten minutes, whatever the interval: a request
+        // every ten seconds to a headset that was off is what wedged the
+        // dongle, but never asking again left a headset that came back
+        // unannounced unlisted for good.
+        let mut asked_out = session(Link::Unknown, None, ago(31));
         asked_out.asks = 3;
         assert!(!asked_out.should_ask(now, minute, Duration::ZERO));
         assert!(!asked_out.should_ask(now, Duration::ZERO, Duration::ZERO));
+        asked_out.asked_at = ago(599);
+        assert!(!asked_out.should_ask(now, Duration::ZERO, Duration::ZERO));
+        asked_out.asked_at = ago(600);
+        assert!(asked_out.should_ask(now, minute, Duration::ZERO));
+        // And the same for however many questions went unanswered.
+        asked_out.asks = 40;
+        assert!(asked_out.should_ask(now, minute, Duration::ZERO));
+        asked_out.asked_at = ago(599);
+        assert!(!asked_out.should_ask(now, minute, Duration::ZERO));
     }
 
     #[test]
@@ -812,10 +860,32 @@ mod tests {
             assert_eq!(session.link, Link::Up);
             session.ask(now).unwrap();
         }
-        // It gave up: no more asking until the dongle speaks again.
+        // It gave up: no more asking until the dongle speaks again, or the
+        // slow cadence comes round.
         assert_eq!(session.link, Link::Unknown);
         assert!(!session.pending);
         assert!(!session.should_ask(now, Duration::from_secs(60), Duration::ZERO));
+        assert!(!session.should_ask(now + ASK_IDLE_RETRY / 2, Duration::ZERO, Duration::ZERO));
+        assert!(session.should_ask(now + ASK_IDLE_RETRY, Duration::ZERO, Duration::ZERO));
+    }
+
+    #[test]
+    fn readings_are_numbered_across_sessions() {
+        // The dongle re-enumerates after every link change, which opens a new
+        // session. The bridge tells a confirmation from a repeated reading by
+        // the number, so the numbering must not restart with the session.
+        let mut readings = 0;
+        let mut first = session(Link::Unknown, None, None);
+        first.take_in(&frame_with(&hex(POWER_ON)), &mut readings);
+        assert_eq!((first.level, first.sample), (Some(99), 1));
+
+        let mut second = session(Link::Unknown, None, None);
+        second.take_in(&frame_with(&hex(POWER_ON)), &mut readings);
+        assert_eq!((second.level, second.sample), (Some(99), 2));
+
+        // A report with no level in it leaves the number alone.
+        second.take_in(&STALE_FRAME, &mut readings);
+        assert_eq!((second.sample, readings), (2, 2));
     }
 
     #[test]
@@ -861,8 +931,8 @@ mod tests {
 
     #[test]
     fn our_own_virtual_battery_is_not_mistaken_for_a_dongle() {
-        let dir = std::env::temp_dir().join(format!("hbi-hidraw-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let class_dir = tempfile::tempdir().unwrap();
+        let dir = class_dir.path();
         for (node, uevent) in [
             // The real dongle, on USB.
             (
@@ -884,16 +954,15 @@ mod tests {
             fs::write(dir.join(node).join("device/uevent"), uevent).unwrap();
         }
 
-        let found = discover(&dir);
+        let found = discover(dir);
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].node, Path::new("/dev/hidraw10"));
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn a_headset_on_a_cable_is_what_charging_looks_like() {
-        let dir = std::env::temp_dir().join(format!("hbi-usb-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let usb_devices = tempfile::tempdir().unwrap();
+        let dir = usb_devices.path();
         let plug = |name: &str, vendor: &str, product: &str| {
             fs::create_dir_all(dir.join(name)).unwrap();
             fs::write(dir.join(name).join("idVendor"), format!("{vendor}\n")).unwrap();
@@ -905,16 +974,15 @@ mod tests {
         plug("1-3", "1532", "00a4");
         // Interfaces and hubs have no idVendor file at all.
         fs::create_dir_all(dir.join("1-5:1.0")).unwrap();
-        assert!(!headset_is_wired(&dir));
+        assert!(!headset_is_wired(dir));
 
         // The headset itself shows up once the cable is in.
         plug("5-2", "3329", "4b1e");
-        assert!(headset_is_wired(&dir));
+        assert!(headset_is_wired(dir));
 
         fs::remove_dir_all(dir.join("5-2")).unwrap();
-        assert!(!headset_is_wired(&dir));
+        assert!(!headset_is_wired(dir));
         assert!(!headset_is_wired(Path::new("/nonexistent/usb")));
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -927,6 +995,9 @@ mod tests {
 
     #[test]
     fn discovery_survives_a_missing_sysfs() {
-        assert!(discover(Path::new("/nonexistent/hidraw")).is_empty());
+        assert_eq!(
+            discover(Path::new("/nonexistent/hidraw")),
+            [] as [Dongle; 0]
+        );
     }
 }

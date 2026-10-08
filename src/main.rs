@@ -29,27 +29,29 @@ const DEFAULT_GROUP: &str = "headset-battery";
 #[command(
     name = "headset-battery-indicator",
     version,
-    about = "Publishes HeadsetControl battery levels to UPower",
-    long_about = "Reads the battery level of a wireless headset with HeadsetControl and \
-                  publishes it as a virtual HID battery, so UPower - and therefore KDE's \
-                  Power & Battery applet - lists the headset like any other peripheral."
+    about = "Publishes a wireless headset's battery level to UPower",
+    long_about = "Reads the battery level of a wireless headset - natively for the Audeze \
+                  Maxwell, through HeadsetControl for everything else - and publishes it as \
+                  a virtual HID battery, so UPower - and therefore KDE's Power & Battery \
+                  applet - lists the headset like any other peripheral.",
+    after_help = "Without a command, the daemon runs with the defaults of `run`."
 )]
 struct Cli {
     #[command(flatten)]
     common: CommonArgs,
 
-    #[command(flatten)]
-    run: RunArgs,
-
+    /// The daemon's own options live under `run` only, rather than also being
+    /// flattened here: accepted at the root, `--interval 30 status` parsed and
+    /// was silently ignored.
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the daemon (default).
+    /// Run the daemon (the default, with its default options).
     Run(RunArgs),
-    /// Print what HeadsetControl currently reports, then exit.
+    /// Print what the readers currently report, then exit.
     Status,
     /// Print a udev rule granting a group access to the detected headsets.
     UdevRules(UdevRulesArgs),
@@ -106,7 +108,7 @@ struct CommonArgs {
     verbose: u8,
 }
 
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 struct RunArgs {
     /// Delay between two readings through headsetcontrol, in seconds.
     #[arg(short, long, value_name = "SECONDS", default_value_t = DEFAULT_INTERVAL_SECS)]
@@ -132,6 +134,20 @@ struct RunArgs {
     uhid: PathBuf,
 }
 
+/// What `run` gets when it is not spelled out: the same defaults as the
+/// attributes above, which a test holds the two to.
+impl Default for RunArgs {
+    fn default() -> Self {
+        Self {
+            interval: DEFAULT_INTERVAL_SECS,
+            native_interval: DEFAULT_NATIVE_INTERVAL_SECS,
+            offline_grace: DEFAULT_OFFLINE_GRACE_SECS,
+            missing_grace: DEFAULT_MISSING_GRACE_SECS,
+            uhid: PathBuf::from(DEV_UHID),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Args)]
 struct UdevRulesArgs {
     /// Group the rule grants access to.
@@ -147,20 +163,23 @@ fn main() -> ExitCode {
         cli.common.headsetcontrol.clone(),
         Duration::from_secs(cli.common.timeout.max(1)),
     );
-    let native_interval = match &cli.command {
-        Some(Command::Run(args)) => args.native_interval,
-        _ => cli.run.native_interval,
+    let command = cli
+        .command
+        .unwrap_or_else(|| Command::Run(RunArgs::default()));
+    let native_interval = match &command {
+        Command::Run(args) => args.native_interval,
+        _ => DEFAULT_NATIVE_INTERVAL_SECS,
     };
-    let source = Source::new(
+    let mut source = Source::new(
         cli.common.backend.into(),
         control,
         Duration::from_secs(native_interval.max(1)),
     );
 
-    let result = match cli.command.unwrap_or(Command::Run(cli.run)) {
+    let result = match command {
         Command::Run(args) => run(&args, source),
-        Command::Status => status(&source),
-        Command::UdevRules(args) => udev_rules(&args, &source),
+        Command::Status => status(&mut source),
+        Command::UdevRules(args) => udev_rules(&args, &mut source),
     };
 
     match result {
@@ -210,7 +229,7 @@ fn run(args: &RunArgs, source: Source) -> Result<()> {
     Bridge::new(config, source, inherited).run(&stop)
 }
 
-fn status(source: &Source) -> Result<()> {
+fn status(source: &mut Source) -> Result<()> {
     let headsets = source.probe_once()?;
     let mut out = std::io::stdout().lock();
 
@@ -243,7 +262,7 @@ fn status(source: &Source) -> Result<()> {
     Ok(())
 }
 
-fn udev_rules(args: &UdevRulesArgs, source: &Source) -> Result<()> {
+fn udev_rules(args: &UdevRulesArgs, source: &mut Source) -> Result<()> {
     let headsets = source.probe_once()?;
     let mut out = std::io::stdout().lock();
 
@@ -282,4 +301,39 @@ fn udev_rules(args: &UdevRulesArgs, source: &Source) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_command_line_is_well_formed() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn running_without_a_command_is_running_with_the_defaults() {
+        // `RunArgs::default()` stands in for `run` when no command is given,
+        // so it has to say what `run` says.
+        let Some(Command::Run(parsed)) = Cli::parse_from(["x", "run"]).command else {
+            panic!("`run` did not parse as itself");
+        };
+        assert_eq!(parsed, RunArgs::default());
+        assert!(Cli::parse_from(["x"]).command.is_none());
+    }
+
+    #[test]
+    fn run_options_belong_to_run() {
+        // The bug this guards against: with the options also accepted at the
+        // root, `--interval 30 status` was valid and `30` went nowhere.
+        assert!(Cli::try_parse_from(["x", "--interval", "30", "status"]).is_err());
+        assert!(Cli::try_parse_from(["x", "status", "--interval", "30"]).is_err());
+        assert!(Cli::try_parse_from(["x", "--interval", "30"]).is_err());
+        assert!(Cli::try_parse_from(["x", "run", "--interval", "30"]).is_ok());
+        // The global ones go anywhere.
+        assert!(Cli::try_parse_from(["x", "--timeout", "3", "status"]).is_ok());
+        assert!(Cli::try_parse_from(["x", "status", "--timeout", "3"]).is_ok());
+    }
 }

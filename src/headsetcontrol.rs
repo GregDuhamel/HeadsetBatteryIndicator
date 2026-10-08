@@ -5,9 +5,11 @@
 //! per-headset protocol knowledge stays upstream, where it is maintained, and
 //! this daemon only has to track a stable JSON shape.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread::sleep;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -15,8 +17,13 @@ use serde::Deserialize;
 
 use crate::headset::{BatteryState, Headset};
 
-/// Interval between two checks on a running `headsetcontrol` child.
+/// Interval between two checks on a running `headsetcontrol` child. It bounds
+/// how long a stop request waits for the child, and how much later than its
+/// exit the child is noticed; a report takes seconds, so both are noise.
 const REAP_INTERVAL: Duration = Duration::from_millis(25);
+
+/// How much of the child's output an error message quotes.
+const QUOTED_OUTPUT: usize = 200;
 
 /// A configured `headsetcontrol` invocation.
 #[derive(Debug, Clone)]
@@ -40,22 +47,41 @@ impl HeadsetControl {
 
     /// Asks HeadsetControl for the battery state of every connected headset.
     ///
+    /// `stop` is looked at while the child runs: a daemon that was asked to
+    /// shut down should not sit out the whole timeout first.
+    ///
     /// # Errors
     ///
     /// Fails if the binary cannot be spawned, does not finish within the
-    /// configured timeout, or writes something other than the expected JSON.
-    pub fn probe(&self) -> Result<Vec<Headset>> {
-        let stdout = self.run(&["--battery", "--output", "json"])?;
-        parse(&stdout).with_context(|| {
+    /// configured timeout, is cut short by `stop`, or writes something other
+    /// than the expected JSON.
+    pub fn probe(&self, stop: &AtomicBool) -> Result<Vec<Headset>> {
+        let output = self.run(&["--battery", "--output", "json"], stop)?;
+        parse(&output.stdout).with_context(|| {
+            // What the child said on stderr is usually the actual explanation
+            // ("device not found", a missing library), so quote it too.
+            let stderr = output.stderr.trim();
+            let stderr = if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(" (stderr: {})", quote(stderr))
+            };
             format!(
-                "unexpected output from {}: {}",
+                "unexpected output from {}: {}{stderr}",
                 self.binary.display(),
-                stdout.trim().chars().take(200).collect::<String>()
+                quote(&output.stdout)
             )
         })
     }
 
-    fn run(&self, args: &[&str]) -> Result<String> {
+    /// Runs the binary to completion, or kills it at the timeout or when
+    /// `stop` is raised.
+    ///
+    /// Both pipes are drained by threads while the child runs. Waiting for
+    /// the exit first and reading afterwards would deadlock on a child that
+    /// writes more than a pipe holds (64 KiB): it blocks on the full pipe,
+    /// and nobody empties it until it exits.
+    fn run(&self, args: &[&str], stop: &AtomicBool) -> Result<Output> {
         let mut child = Command::new(&self.binary)
             .args(args)
             .stdin(Stdio::null())
@@ -64,28 +90,77 @@ impl HeadsetControl {
             .spawn()
             .with_context(|| format!("could not run {}", self.binary.display()))?;
 
+        let stdout = drain(child.stdout.take());
+        let stderr = drain(child.stderr.take());
+
         let deadline = Instant::now() + self.timeout;
         loop {
-            match child.try_wait().context("waiting for headsetcontrol")? {
-                Some(_) => break,
-                None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    bail!(
-                        "{} did not answer within {:?}",
-                        self.binary.display(),
-                        self.timeout
-                    );
-                }
-                None => sleep(REAP_INTERVAL),
+            if child
+                .try_wait()
+                .context("waiting for headsetcontrol")?
+                .is_some()
+            {
+                break;
             }
+            if stop.load(Ordering::Relaxed) {
+                kill(&mut child);
+                bail!("stopped while waiting for {}", self.binary.display());
+            }
+            if Instant::now() >= deadline {
+                kill(&mut child);
+                bail!(
+                    "{} did not answer within {:?}",
+                    self.binary.display(),
+                    self.timeout
+                );
+            }
+            sleep(REAP_INTERVAL);
         }
 
-        let output = child
-            .wait_with_output()
-            .context("collecting headsetcontrol output")?;
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        // The child is gone, so its end of each pipe is closed and the
+        // readers are finishing. (A grandchild left holding a pipe would
+        // keep them going, as it kept `wait_with_output()` going before;
+        // headsetcontrol forks nothing.)
+        Ok(Output {
+            stdout: stdout.join().unwrap_or_default(),
+            stderr: stderr.join().unwrap_or_default(),
+        })
     }
+}
+
+/// What a finished child wrote.
+struct Output {
+    stdout: String,
+    stderr: String,
+}
+
+/// Reads a pipe to its end on a thread of its own, lossily as text.
+fn drain(pipe: Option<impl Read + Send + 'static>) -> thread::JoinHandle<String> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            // A read error ends the stream like EOF; whatever came before
+            // is still worth quoting.
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    })
+}
+
+/// Kills a child that outstayed its welcome and reaps it.
+///
+/// The reader threads are left to themselves rather than joined: a shell
+/// wrapper that forked `headsetcontrol` instead of exec'ing it dies here while
+/// its child keeps the pipes open, and joining would wait for that grandchild.
+/// They end on their own once the last writer goes.
+fn kill(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The first [`QUOTED_OUTPUT`] characters of some output, for an error message.
+fn quote(output: &str) -> String {
+    output.trim().chars().take(QUOTED_OUTPUT).collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,9 +308,9 @@ mod tests {
     #[test]
     fn tolerates_a_text_preamble_and_an_empty_document() {
         let json = "No config file found\n{\"devices\":[]}";
-        assert!(parse(json).unwrap().is_empty());
-        assert!(parse("").unwrap().is_empty());
-        assert!(parse("   \n").unwrap().is_empty());
+        assert_eq!(parse(json).unwrap(), [] as [Headset; 0]);
+        assert_eq!(parse("").unwrap(), [] as [Headset; 0]);
+        assert_eq!(parse("   \n").unwrap(), [] as [Headset; 0]);
     }
 
     #[test]

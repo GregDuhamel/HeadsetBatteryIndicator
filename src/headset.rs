@@ -14,12 +14,12 @@ pub enum BatteryState {
     Disconnected,
 }
 
-/// One headset, as reported by HeadsetControl.
+/// One headset, as reported by whichever reader found it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Headset {
     /// Model name, for example `Audeze Maxwell`.
     pub name: String,
-    /// Product string of the endpoint HeadsetControl talks to, for example
+    /// Product string of the endpoint the reader talks to, for example
     /// `Audeze Maxwell XBOX Dongle`.
     pub product: String,
     /// USB vendor ID.
