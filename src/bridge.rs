@@ -1,18 +1,20 @@
 //! The daemon itself: read the batteries, mirror them onto virtual HID
 //! batteries, and keep answering the kernel in between.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::{Index, IndexMut};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use log::{debug, error, info, trace, warn};
-use rustix::event::{PollFd, PollFlags};
 
 use crate::headset::{BatteryState, Headset};
 use crate::source::Source;
-use uhid_battery::{Battery, DEV_UHID, Handle, Identity, Kind};
+use uhid_battery::{
+    Battery, CreateErrorKind, DEV_UHID, Handle, Identity, Kind, Reading, Wakeup, serve_all,
+};
 
 /// Default for [`Config::interval`], in seconds.
 pub const DEFAULT_INTERVAL_SECS: u64 = 60;
@@ -35,7 +37,8 @@ const ATTACH_RETRY: Duration = Duration::from_secs(60);
 /// kernel still probing the device; a streak means the device is broken, and
 /// an error that is never acted on would otherwise be logged on every tick
 /// for ever. Three, so that a transient failure never costs a recreation,
-/// while a lasting one is acted on within a few seconds.
+/// while a lasting one is acted on within a few ticks - or at once, when it
+/// is servicing that fails (see [`Bridge::wait`]).
 const DEVICE_FAILURE_LIMIT: u32 = 3;
 
 /// How long the dongle has to keep saying the headset is gone before it is
@@ -59,9 +62,10 @@ pub const DEFAULT_MISSING_GRACE_SECS: u64 = 30;
 /// is cheap to undo, the battery is back on the first poll that answers.
 const UNANSWERED_RETRY: Duration = Duration::from_secs(3);
 
-/// The longest a single `poll()` may block. A signal interrupts `poll()`, so
-/// this only bounds the shutdown delay in the unlucky case where the signal
-/// lands between checking the stop flag and entering the call.
+/// The longest a single [`serve_all`] may block. A signal interrupts the
+/// `poll()` underneath, so this only bounds the shutdown delay in the unlucky
+/// case where the signal lands between checking the stop flag and entering
+/// the call.
 const MAX_WAIT: Duration = Duration::from_secs(5);
 
 /// First component of the virtual devices' `phys`, which the udev rule that
@@ -249,12 +253,12 @@ impl Default for Config {
     }
 }
 
-/// A virtual battery mirroring one headset.
+/// What the daemon knows about one virtual battery, besides the device itself
+/// - which lives in [`Batteries`], at the same index.
 #[derive(Debug)]
 struct VirtualBattery {
     key: String,
     name: String,
-    device: Battery,
     /// When the headset last gave us a usable level.
     last_reading: Instant,
     /// When the headset was last reported at all, answering or not.
@@ -281,20 +285,101 @@ struct VirtualBattery {
     failures: u32,
 }
 
-impl VirtualBattery {
-    /// Pushes a reading to the kernel.
-    fn publish(&mut self, percent: u8, charging: bool) -> Result<()> {
-        self.device
-            .update(percent, charging)
-            .with_context(|| format!("publishing the level of {}", self.name))
+/// The virtual batteries: the devices, and what the daemon knows about each.
+///
+/// Two vectors rather than one of pairs, because [`serve_all`] wants the
+/// [`Battery`] values contiguous (`&mut [Battery]`) and nothing else about
+/// them. An index means the same in both; every change goes through here so
+/// that they cannot drift apart. Indexing yields the bookkeeping, which is
+/// what most of the daemon reads; the device is asked for by name.
+#[derive(Debug, Default)]
+struct Batteries {
+    devices: Vec<Battery>,
+    states: Vec<VirtualBattery>,
+}
+
+impl Batteries {
+    fn len(&self) -> usize {
+        self.states.len()
     }
 
-    /// Answers the kernel, which would otherwise keep whoever is reading the
-    /// level from sysfs waiting for five seconds.
-    fn service(&mut self) -> Result<()> {
-        self.device
-            .service()
-            .with_context(|| format!("servicing the virtual device of {}", self.name))
+    /// The index of the battery mirroring the headset with this key.
+    fn position(&self, key: &str) -> Option<usize> {
+        self.states.iter().position(|state| state.key == key)
+    }
+
+    fn push(&mut self, device: Battery, state: VirtualBattery) {
+        self.devices.push(device);
+        self.states.push(state);
+    }
+
+    /// Takes a battery out, closing the gap: every index past it moves down
+    /// by one, as with `Vec::remove`.
+    fn remove(&mut self, index: usize) -> (Battery, VirtualBattery) {
+        (self.devices.remove(index), self.states.remove(index))
+    }
+
+    fn drain(&mut self) -> impl Iterator<Item = (Battery, VirtualBattery)> + '_ {
+        self.devices.drain(..).zip(self.states.drain(..))
+    }
+
+    fn device(&self, index: usize) -> &Battery {
+        &self.devices[index]
+    }
+
+    /// The device and its bookkeeping, borrowed together: they are separate
+    /// fields, so both can be held mutably at once.
+    fn pair_mut(&mut self, index: usize) -> (&mut Battery, &mut VirtualBattery) {
+        (&mut self.devices[index], &mut self.states[index])
+    }
+
+    /// Every device, the way [`serve_all`] wants them.
+    fn devices_mut(&mut self) -> &mut [Battery] {
+        &mut self.devices
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &VirtualBattery> {
+        self.states.iter()
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut VirtualBattery> {
+        self.states.iter_mut()
+    }
+}
+
+impl Index<usize> for Batteries {
+    type Output = VirtualBattery;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.states[index]
+    }
+}
+
+impl IndexMut<usize> for Batteries {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.states[index]
+    }
+}
+
+/// Why a virtual battery could not be created.
+#[derive(Debug)]
+enum AttachFailure {
+    /// The kernel said no this time - a device still being torn down on the
+    /// handle, no descriptor left - or the power supply never showed up. Worth
+    /// another try after [`ATTACH_RETRY`].
+    Retry(anyhow::Error),
+    /// The identity itself was refused, before anything reached the kernel.
+    /// It is built from the vendor and product IDs and the model name, none
+    /// of which will change: trying again every minute would only log the
+    /// same error every minute, for as long as the daemon runs.
+    GiveUp(anyhow::Error),
+}
+
+/// Whatever `?` propagates out of the attach path is worth a retry; the one
+/// failure that is not is sorted out by hand.
+impl From<anyhow::Error> for AttachFailure {
+    fn from(err: anyhow::Error) -> Self {
+        Self::Retry(err)
     }
 }
 
@@ -349,10 +434,13 @@ pub struct Bridge {
     config: Config,
     source: Source,
     pool: DevicePool,
-    batteries: Vec<VirtualBattery>,
+    batteries: Batteries,
     probe_failing: bool,
     /// Headsets whose battery could not be created, and when to try again.
     attach_retry_at: BTreeMap<String, Instant>,
+    /// Headsets whose identity the kernel can never accept
+    /// ([`AttachFailure::GiveUp`]): said once, then never tried again.
+    abandoned: BTreeSet<String>,
     last_summary: Option<Summary>,
     /// A summary that differs from the announced one, and since when.
     unsettled: Option<(Summary, Instant)>,
@@ -367,9 +455,10 @@ impl Bridge {
             config,
             source,
             pool,
-            batteries: Vec::new(),
+            batteries: Batteries::default(),
             probe_failing: false,
             attach_retry_at: BTreeMap::new(),
+            abandoned: BTreeSet::new(),
             last_summary: None,
             unsettled: None,
         }
@@ -453,7 +542,7 @@ impl Bridge {
             }
         }
 
-        for battery in &mut self.batteries {
+        for battery in self.batteries.iter_mut() {
             note(&mut battery.silent_since, battery.last_reading == now, now);
             note(&mut battery.missing_since, battery.last_seen == now, now);
         }
@@ -518,7 +607,7 @@ impl Bridge {
     /// Creates or updates the virtual battery backing `headset`.
     fn apply(&mut self, headset: &Headset, now: Instant) -> Result<()> {
         let key = headset.key();
-        let existing = self.batteries.iter().position(|b| b.key == key);
+        let existing = self.batteries.position(&key);
 
         // Being listed at all is what keeps the entry alive; answering is what
         // refreshes the level.
@@ -526,9 +615,12 @@ impl Bridge {
             self.batteries[index].last_seen = now;
         }
 
-        let (percent, charging) = match headset.battery {
-            BatteryState::Discharging(percent) => (percent, false),
-            BatteryState::Charging(Some(percent)) => (percent, true),
+        // The daemon's own notion of a battery is richer than uhid-battery's
+        // `Reading` - it knows about a headset that is off, or charging with
+        // no level to show. This is where the one narrows to the other.
+        let reading = match headset.battery {
+            BatteryState::Discharging(percent) => Reading::new(percent, false),
+            BatteryState::Charging(Some(percent)) => Reading::new(percent, true),
             // A headset that reports charging without a level keeps whatever
             // we last knew; there is nothing better to show, and dropping the
             // device would make it blink out of the applet.
@@ -540,7 +632,7 @@ impl Bridge {
                     );
                     return Ok(());
                 };
-                (self.batteries[index].device.percent(), true)
+                Reading::new(self.batteries.device(index).reading().percent, true)
             }
             BatteryState::Unavailable => {
                 trace!("{} is offline", headset.name);
@@ -551,9 +643,9 @@ impl Bridge {
                 if let Some(index) = existing {
                     let since = *self.batteries[index].gone_since.get_or_insert(now);
                     if now.duration_since(since) >= DISCONNECT_SETTLE {
-                        let battery = self.batteries.remove(index);
+                        let (device, battery) = self.batteries.remove(index);
                         info!("{} was switched off, removing its battery", battery.name);
-                        self.pool.release(battery.device);
+                        self.pool.release(device);
                     }
                 }
                 return Ok(());
@@ -561,36 +653,45 @@ impl Bridge {
         };
 
         let Some(index) = existing else {
-            if self
+            let retry_pending = self
                 .attach_retry_at
                 .get(&key)
-                .is_some_and(|retry_at| now < *retry_at)
-            {
+                .is_some_and(|retry_at| now < *retry_at);
+            if retry_pending || self.abandoned.contains(&key) {
                 return Ok(());
             }
-            let attached = self.attach(headset, percent, charging, now);
-            if attached.is_ok() {
-                self.attach_retry_at.remove(&key);
-            } else {
-                self.attach_retry_at.insert(key, now + ATTACH_RETRY);
-            }
-            return attached;
+            return match self.attach(headset, reading, now) {
+                Ok(()) => {
+                    self.attach_retry_at.remove(&key);
+                    Ok(())
+                }
+                Err(AttachFailure::Retry(err)) => {
+                    self.attach_retry_at.insert(key, now + ATTACH_RETRY);
+                    Err(err)
+                }
+                // Logged once by the caller, like any other error - and then
+                // never again, since the headset is skipped from here on.
+                Err(AttachFailure::GiveUp(err)) => {
+                    self.abandoned.insert(key);
+                    Err(err.context("giving up on this headset until the daemon restarts"))
+                }
+            };
         };
 
-        let battery = &mut self.batteries[index];
+        let (device, battery) = self.batteries.pair_mut(index);
         // The headset answered, so it is alive even if we end up distrusting
         // the level it gave us.
         battery.last_reading = now;
         battery.gone_since = None;
 
-        let (known_percent, known_charging) = (battery.device.percent(), battery.device.charging());
+        let known = device.reading();
         let confirming = second_opinion(battery.deferred, battery.deferred_sample, headset.sample);
-        if vet(known_percent, percent, confirming) == Verdict::Defer {
+        if vet(known.percent, reading.percent, confirming) == Verdict::Defer {
             debug!(
-                "{}: holding back an implausible {percent}% (last known {known_percent}%)",
-                battery.name
+                "{}: holding back an implausible {}% (last known {}%)",
+                battery.name, reading.percent, known.percent
             );
-            battery.deferred = Some(percent);
+            battery.deferred = Some(reading.percent);
             battery.deferred_sample = headset.sample;
             return Ok(());
         }
@@ -600,13 +701,16 @@ impl Bridge {
         // An unchanged level is still pushed now and then. The kernel drops input
         // reports without telling anyone while it is probing the device, so
         // this is what guarantees a lost push is made up for.
-        let changed = known_percent != percent || known_charging != charging;
+        let changed = known != reading;
         if !changed && now.duration_since(battery.published_at) < REPUBLISH_EVERY {
             return Ok(());
         }
         if changed {
-            let suffix = if charging { ", charging" } else { "" };
-            if known_charging != charging || battery.logged_percent.abs_diff(percent) >= LOG_STEP {
+            let percent = reading.percent;
+            let suffix = if reading.charging { ", charging" } else { "" };
+            if known.charging != reading.charging
+                || battery.logged_percent.abs_diff(percent) >= LOG_STEP
+            {
                 battery.logged_percent = percent;
                 info!("{}: {percent}%{suffix}", battery.name);
             } else {
@@ -614,7 +718,9 @@ impl Bridge {
             }
         }
         battery.published_at = now;
-        let pushed = battery.publish(percent, charging);
+        let pushed = device
+            .update(reading)
+            .with_context(|| format!("publishing the level of {}", battery.name));
         self.outcome(index, pushed, now);
         Ok(())
     }
@@ -649,14 +755,14 @@ impl Bridge {
             return true;
         }
 
-        let battery = self.batteries.remove(index);
+        let (device, battery) = self.batteries.remove(index);
         warn!(
             "{}: {DEVICE_FAILURE_LIMIT} failures in a row, destroying its virtual device; \
              creating it again in {ATTACH_RETRY:?}",
             battery.name
         );
         self.attach_retry_at.insert(battery.key, now + ATTACH_RETRY);
-        self.pool.release(battery.device);
+        self.pool.release(device);
         false
     }
 
@@ -664,27 +770,40 @@ impl Bridge {
     fn attach(
         &mut self,
         headset: &Headset,
-        percent: u8,
-        charging: bool,
+        reading: Reading,
         now: Instant,
-    ) -> Result<()> {
+    ) -> Result<(), AttachFailure> {
         let uniq = headset.uniq();
-        let identity = Identity {
-            name: headset.display_name(),
-            phys: format!("{PHYS_PREFIX}/{uniq}"),
-            uniq: uniq.clone(),
-            vendor: u32::from(headset.vendor_id),
-            product: u32::from(headset.product_id),
-        };
+        let identity = Identity::new(headset.display_name(), uniq.clone())
+            .phys(format!("{PHYS_PREFIX}/{uniq}"))
+            .vendor(headset.vendor_id)
+            .product(headset.product_id);
 
         let handle = self.pool.acquire()?;
-        let mut device = match Battery::create(handle, &identity, Kind::Headset, percent, charging)
-        {
+        let mut device = match Battery::create(handle, &identity, Kind::Headset, reading) {
             Ok(device) => device,
             Err(err) => {
+                let kind = err.kind();
                 let (handle, source) = err.into_parts();
                 self.pool.put_back(handle);
-                return Err(source).context("creating the virtual HID battery");
+                // An identity the kernel would truncate is refused before
+                // anything is written, and it is built from nothing that
+                // changes while the daemon runs: a retry would fail the same
+                // way. `display_name` and `uniq` are meant to make that
+                // impossible, so this is a bug report in the making.
+                if kind == CreateErrorKind::InvalidIdentity {
+                    return Err(source)
+                        .with_context(|| {
+                            format!(
+                                "the kernel can never accept its identity (name {:?}, uniq {:?})",
+                                identity.name, identity.uniq
+                            )
+                        })
+                        .map_err(AttachFailure::GiveUp);
+                }
+                return Err(source)
+                    .context("creating the virtual HID battery")
+                    .map_err(AttachFailure::Retry);
             }
         };
 
@@ -695,38 +814,43 @@ impl Bridge {
             Ok(Some(sysfs)) => sysfs,
             Ok(None) => {
                 self.pool.release(device);
-                anyhow::bail!(
+                return Err(AttachFailure::Retry(anyhow::anyhow!(
                     "the kernel created the HID device but no hid-{uniq}-battery power supply; \
                      is CONFIG_HID_BATTERY_STRENGTH enabled? (see `journalctl -k`)"
-                );
+                )));
             }
             Err(err) => {
                 self.pool.release(device);
-                return Err(err).context("waiting for the power supply");
+                return Err(err)
+                    .context("waiting for the power supply")
+                    .map_err(AttachFailure::Retry);
             }
         };
 
         info!(
-            "{} appeared: {percent}%{} ({})",
+            "{} appeared: {}%{} ({})",
             headset.name,
-            if charging { ", charging" } else { "" },
+            reading.percent,
+            if reading.charging { ", charging" } else { "" },
             sysfs.display()
         );
-        self.batteries.push(VirtualBattery {
-            key: headset.key(),
-            name: headset.name.clone(),
+        self.batteries.push(
             device,
-            last_reading: now,
-            last_seen: now,
-            silent_since: None,
-            missing_since: None,
-            gone_since: None,
-            deferred: None,
-            deferred_sample: None,
-            logged_percent: percent,
-            published_at: now,
-            failures: 0,
-        });
+            VirtualBattery {
+                key: headset.key(),
+                name: headset.name.clone(),
+                last_reading: now,
+                last_seen: now,
+                silent_since: None,
+                missing_since: None,
+                gone_since: None,
+                deferred: None,
+                deferred_sample: None,
+                logged_percent: reading.percent,
+                published_at: now,
+                failures: 0,
+            },
+        );
         Ok(())
     }
 
@@ -753,60 +877,57 @@ impl Bridge {
                 Withdrawal::Missing => "is no longer detected",
             };
 
-            let battery = self.batteries.remove(index);
+            let (device, battery) = self.batteries.remove(index);
             info!("{} {reason}, removing its battery", battery.name);
-            self.pool.release(battery.device);
+            self.pool.release(device);
         }
     }
 
-    /// Waits for uhid events, for at most `timeout`, then services every
-    /// battery.
+    /// Serves every battery - answers the kernel, which would otherwise keep
+    /// whoever is reading the level from sysfs waiting for five seconds, and
+    /// pushes whatever is due - for at most `timeout`.
     ///
     /// With no battery to watch this is a plain sleep, but still through
     /// `poll()`: unlike `thread::sleep`, it returns when a signal arrives.
     fn wait(&mut self, timeout: Duration) -> Result<()> {
-        // Wake up early only if a battery has a push of its own coming up.
-        let now = Instant::now();
-        let timeout = self
-            .batteries
-            .iter()
-            .filter_map(|battery| battery.device.next_deadline())
-            .map(|due| due.saturating_duration_since(now))
-            .fold(timeout, Duration::min);
+        let deadline = Instant::now() + timeout;
+        loop {
+            let err = match serve_all(self.batteries.devices_mut(), Some(deadline), None) {
+                // `Wake` cannot happen - no wake descriptor is handed over -
+                // and a signal is the caller's business: it checks the stop
+                // flag before calling again.
+                Ok(Wakeup::Deadline | Wakeup::Interrupted | Wakeup::Wake) => return Ok(()),
+                Err(err) => err,
+            };
+            // No index: the wait itself failed, and no battery is to blame.
+            let Some(index) = err.index() else {
+                return Err(err.into_source()).context("waiting on /dev/uhid");
+            };
 
-        let mut fds: Vec<PollFd<'_>> = self
-            .batteries
-            .iter()
-            .map(|battery| PollFd::new(&battery.device, PollFlags::IN))
-            .collect();
-        match crate::poll::poll(&mut fds, timeout) {
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => return Ok(()),
-            Err(err) => return Err(err).context("waiting on /dev/uhid"),
+            // `serve_all` stops at the first battery that fails, before the
+            // ones after it are serviced. The failure goes through the usual
+            // policy, then the loop serves again with the same deadline: the
+            // others get their turn, and so does the culprit if it is still
+            // there. A device that keeps failing fails again at once - the
+            // read never blocks - so it collects its DEVICE_FAILURE_LIMIT
+            // strikes and is destroyed within this call, which is also what
+            // stops a broken descriptor from waking `poll()` for ever.
+            let serviced = Err(err.into_source()).with_context(|| {
+                format!(
+                    "servicing the virtual device of {}",
+                    self.batteries[index].name
+                )
+            });
+            self.outcome(index, serviced, Instant::now());
         }
-        drop(fds);
-
-        // Servicing is a non-blocking read, so there is no point in working
-        // out which descriptor was ready - and a due push needs it regardless.
-        // A device that fails is given up on by `outcome`, which also stops
-        // a broken descriptor from waking `poll()` again and again for ever.
-        let now = Instant::now();
-        let mut index = 0;
-        while index < self.batteries.len() {
-            let serviced = self.batteries[index].service();
-            if self.outcome(index, serviced, now) {
-                index += 1;
-            }
-        }
-        Ok(())
     }
 
     /// Removes every virtual battery, so the applet does not keep a stale entry
     /// around while the daemon is restarting.
     fn shutdown(&mut self) {
-        for battery in self.batteries.drain(..) {
+        for (device, battery) in self.batteries.drain() {
             debug!("withdrawing {}", battery.name);
-            drop(battery.device.destroy());
+            drop(device.destroy());
         }
     }
 }

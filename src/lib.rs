@@ -23,5 +23,4 @@ pub mod bridge;
 pub mod headset;
 pub mod headsetcontrol;
 pub mod maxwell;
-mod poll;
 pub mod source;
