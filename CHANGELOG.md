@@ -5,6 +5,49 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-10-09
+
+The daemon now tells a wedged dongle from a headset that is switched off, and
+asks a linked headset five times less often.
+
+### Added
+
+- A wedge detector for the Audeze Maxwell dongle (`src/maxwell/wedge.rs`).
+  On 2026-09-22 an Xbox dongle wedged - audio still playing, status channel
+  answering nothing, answer report frozen with an old level inside - and the
+  daemon reported "detected but not answering battery queries (switched
+  off?)" for two weeks, which from the HID side is what a headset that is
+  off looks like. The tell is the audio: the dongle's ALSA card only exists
+  while a headset is linked, and a playback PCM in `RUNNING` state means
+  sound is reaching one. Once the dongle has said nothing for ten minutes
+  (the slow cadence has asked it at least once by then) the reader finds the
+  card through sysfs (hidraw node, USB interface, USB device, its other
+  interfaces' `sound/cardN`) and reads `/proc/asound/cardN/pcm*p/sub0/
+  status`, at most every thirty seconds. If sound is playing it warns
+  *"the Audeze dongle is streaming audio but has answered nothing for 3h: it
+  is most likely wedged — unplug and replug the dongle (power-cycling the
+  headset is not enough)"*, once and then once a day, and logs *"the dongle
+  answers again"* when it is over. It sends the dongle nothing more: the
+  request budget is untouched. `status` prints *"dongle: not answering,
+  audio running — probably wedged"* under the headset when its one request
+  goes unanswered while sound plays. Tested on fake sysfs and `/proc/asound`
+  trees (running, closed, capture only, several PCMs, no card, card without
+  `/proc`) and with an injected clock (first warning at ten minutes, the
+  probe every thirty seconds, the reminder a day later, the recovery).
+- README: *When the dongle wedges anyway*, and a Troubleshooting entry *The
+  headset works but UPower shows nothing* with the diagnosis, the cause and
+  the remedy; the module documentation of `maxwell` tells the incident.
+
+### Changed
+
+- `--native-interval` defaults to 300 s, from 60. The Maxwell's battery
+  lasts some eighty hours, a percent every fifty minutes, so five questions
+  an hour resolve every step of it; and each question is a risk, since
+  unanswered requests are what wedge the dongle. The unit's `--interval 60`
+  concerns HeadsetControl and is unchanged.
+- The unit no longer sets `ProcSubset=pid`, which hid `/proc/asound` from
+  the daemon. `ProtectProc=invisible` and `ProtectKernelTunables=` stay.
+
 ## [0.5.0] - 2026-10-09
 
 The two large modules are split into directories, and the release binary is
@@ -181,6 +224,7 @@ Review fixes of the first phase.
 notes are on the
 [GitHub releases page](https://github.com/GregDuhamel/HeadsetBatteryIndicator/releases).
 
+[0.6.0]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.2.2...v0.3.0

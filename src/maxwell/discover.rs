@@ -41,14 +41,19 @@ pub(super) struct Dongle {
     /// product strings), reported as [`Headset::product`].
     pub(super) product: String,
     pub(super) product_id: u16,
+    /// The dongle's USB device directory in sysfs (`/sys/bus/usb/devices/1-5`
+    /// resolved), where its sound card hangs next to its HID interface; see
+    /// [`usb_device_of`]. `None` when the tree does not look like USB.
+    pub(super) usb_device: Option<PathBuf>,
 }
 
 impl Dongle {
     /// The dongle behind a hidraw node, if the node is one. [`discover`](super::discover()) has
     /// already kept Audeze's devices on USB; the product ID is what is left to
     /// check.
-    fn from_node(node: hidraw::Node) -> Option<Self> {
+    fn from_node(node: hidraw::Node, sysfs_root: &Path) -> Option<Self> {
         supports(node.vendor, node.product).then(|| Self {
+            usb_device: usb_device_of(sysfs_root, &node.path),
             node: node.path,
             product: if node.name.is_empty() {
                 DEFAULT_PRODUCT.to_owned()
@@ -60,6 +65,24 @@ impl Dongle {
     }
 }
 
+/// The USB device a hidraw node hangs under.
+///
+/// `/sys/class/hidraw/hidrawN/device` points at the HID device
+/// (`0003:3329:4B18.0018`), which sits under the USB interface (`1-5:1.0`),
+/// which sits under the USB device (`1-5`) - the one directory that carries
+/// `idVendor`, and whose other interfaces carry the sound card the wedge
+/// detector reads. `None` when the links do not resolve, or what they lead to
+/// is not a USB device.
+fn usb_device_of(sysfs_root: &Path, node: &Path) -> Option<PathBuf> {
+    let name = node.file_name()?;
+    let hid_device = fs::canonicalize(sysfs_root.join(name).join("device")).ok()?;
+    let usb_device = hid_device.parent()?.parent()?;
+    usb_device
+        .join("idVendor")
+        .is_file()
+        .then(|| usb_device.to_path_buf())
+}
+
 /// As [`discover`](super::discover()), with the hidraw class directory and the device directory
 /// given, so that a fake tree can stand in for sysfs under test.
 ///
@@ -69,7 +92,10 @@ impl Dongle {
 pub(super) fn discover_in(sysfs_root: &Path, dev_root: &Path) -> Vec<Dongle> {
     let filter = Filter::new().bus(Bus::Usb).vendor(VENDOR_ID);
     match hidraw::discover_in(sysfs_root, dev_root, &filter) {
-        Ok(nodes) => nodes.into_iter().filter_map(Dongle::from_node).collect(),
+        Ok(nodes) => nodes
+            .into_iter()
+            .filter_map(|node| Dongle::from_node(node, sysfs_root))
+            .collect(),
         Err(err) => {
             debug!("cannot list {}: {err}", sysfs_root.display());
             Vec::new()
@@ -122,14 +148,47 @@ mod tests {
                     node: PathBuf::from("/dev/hidraw3"),
                     product: DEFAULT_PRODUCT.to_owned(),
                     product_id: 0x4b19,
+                    // A `device` that is a plain directory leads nowhere USB.
+                    usb_device: None,
                 },
                 Dongle {
                     node: PathBuf::from("/dev/hidraw10"),
                     product: "Audeze Dongle".to_owned(),
                     product_id: 0x4b18,
+                    usb_device: None,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn the_usb_device_is_two_levels_above_the_hid_device() {
+        // The real layout: the class entry's `device` is a symlink into
+        // /sys/devices, at the HID device under the interface under the
+        // USB device.
+        let tmp = tempfile::tempdir().unwrap();
+        let devices = tmp.path().join("devices/usb1/1-5");
+        let hid = devices.join("1-5:1.0/0003:3329:4B18.0018");
+        fs::create_dir_all(&hid).unwrap();
+        fs::write(devices.join("idVendor"), "3329\n").unwrap();
+        let class = tmp.path().join("class/hidraw");
+        fs::create_dir_all(class.join("hidraw10")).unwrap();
+        std::os::unix::fs::symlink(&hid, class.join("hidraw10/device")).unwrap();
+
+        assert_eq!(
+            usb_device_of(&class, Path::new("/dev/hidraw10")),
+            Some(fs::canonicalize(&devices).unwrap())
+        );
+        // A node sysfs does not list, and one whose tree is not USB (the
+        // uhid device of the virtual battery has no interface above it).
+        assert_eq!(usb_device_of(&class, Path::new("/dev/hidraw11")), None);
+        let uhid = tmp
+            .path()
+            .join("devices/virtual/misc/uhid/0006:3329:4B18.0017");
+        fs::create_dir_all(&uhid).unwrap();
+        fs::create_dir_all(class.join("hidraw16")).unwrap();
+        std::os::unix::fs::symlink(&uhid, class.join("hidraw16/device")).unwrap();
+        assert_eq!(usb_device_of(&class, Path::new("/dev/hidraw16")), None);
     }
 
     #[test]
