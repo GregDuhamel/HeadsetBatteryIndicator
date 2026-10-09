@@ -1,7 +1,6 @@
 # Headset Battery Indicator
 
 [![CI](https://github.com/GregDuhamel/HeadsetBatteryIndicator/actions/workflows/ci.yml/badge.svg)](https://github.com/GregDuhamel/HeadsetBatteryIndicator/actions/workflows/ci.yml)
-[![Lint](https://github.com/GregDuhamel/HeadsetBatteryIndicator/actions/workflows/lint.yml/badge.svg)](https://github.com/GregDuhamel/HeadsetBatteryIndicator/actions/workflows/lint.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 Makes a wireless gaming headset show up in **KDE's Power & Battery applet**, next
