@@ -10,9 +10,21 @@ name: Release
 #
 # It refuses to run if that tag exists, so a forgotten bump cannot silently
 # re-release the previous version.
+#
+# The binary is built for `x86_64-unknown-linux-musl`, statically linked, so
+# the one file runs on any x86_64 Linux whatever its glibc: nothing in the
+# dependency tree links C code (`rustix` goes through `linux-raw-sys`, the
+# `libc` crate `signal-hook` pulls in is bound to musl's own libc, and
+# `serde_json`, `env_logger` and `clap` are pure Rust). The tests still run
+# on the host target, where `/dev/null` and the socket pairs the fakes use
+# behave the same.
 
 on:
   workflow_dispatch:
+
+env:
+  TARGET: x86_64-unknown-linux-musl
+  ARTIFACT: headset-battery-indicator-x86_64-linux
 
 jobs:
   release:
@@ -42,23 +54,47 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install the musl target
+        run: rustup target add "$TARGET"
+
       - name: Cache
         uses: Swatinem/rust-cache@v2
 
       - name: cargo test
         run: cargo test --locked --all-targets
 
-      - name: cargo build --release
-        run: cargo build --locked --release
+      - name: cargo build --release (static, musl)
+        run: cargo build --locked --release --target "$TARGET"
+
+      # `file` is the proof: a musl build that picked up a dynamic dependency
+      # would say "dynamically linked" and name an interpreter. Rust's musl
+      # target produces a static PIE, which recent `file` reports as
+      # "static-pie linked" rather than "statically linked"; both are static.
+      - name: Check that the binary is statically linked
+        run: |
+          described=$(file "target/$TARGET/release/headset-battery-indicator")
+          echo "$described"
+          case "$described" in
+            *"statically linked"* | *"static-pie linked"*) ;;
+            *)
+              echo "::error::the release binary is not statically linked"
+              exit 1
+              ;;
+          esac
 
       - name: Check that the binary reports the version being released
         run: |
-          reported=$(target/release/headset-battery-indicator --version)
+          reported=$("target/$TARGET/release/headset-battery-indicator" --version)
           echo "$reported"
           [ "$reported" = "headset-battery-indicator ${{ steps.version.outputs.version }}" ]
 
-      - name: Rename binary
-        run: cp target/release/headset-battery-indicator headset-battery-indicator-x86_64-linux
+      # One checksum file next to the binary, in the format `sha256sum -c`
+      # reads back: the README says how.
+      - name: Name the binary and write its checksum
+        run: |
+          cp "target/$TARGET/release/headset-battery-indicator" "$ARTIFACT"
+          sha256sum "$ARTIFACT" > SHA256SUMS
+          cat SHA256SUMS
 
       # The action creates the tag on this commit; tags are not covered by the
       # rules on `main`.
@@ -67,5 +103,7 @@ jobs:
         with:
           tag_name: v${{ steps.version.outputs.version }}
           target_commitish: ${{ github.sha }}
-          files: headset-battery-indicator-x86_64-linux
+          files: |
+            ${{ env.ARTIFACT }}
+            SHA256SUMS
           generate_release_notes: true

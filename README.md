@@ -171,6 +171,19 @@ currently detects, installs the systemd unit and starts it.
 
 Remove everything with `sudo ./install.sh --uninstall`.
 
+There is no need to build: every [release](https://github.com/GregDuhamel/HeadsetBatteryIndicator/releases)
+ships a statically linked `headset-battery-indicator-x86_64-linux` that runs on
+any x86_64 Linux, whatever its glibc. `install.sh` takes the binary from
+`target/release`, so put the downloaded one there after checking it (see
+[Releasing](#releasing)):
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+mkdir -p target/release
+install -m0755 headset-battery-indicator-x86_64-linux target/release/headset-battery-indicator
+sudo ./install.sh
+```
+
 Then check the result:
 
 ```sh
@@ -322,6 +335,31 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
+### Source layout
+
+```
+src/
+├── main.rs          command line, logging, the one `unsafe` (systemd's descriptors)
+├── lib.rs           the crate: one module per concern below
+├── headset.rs       what a reading is: `Headset`, `BatteryState`, the uhid identity
+├── source.rs        which reader answers: `Backend`, `Source`, the `BatterySource` seam
+├── headsetcontrol.rs  the HeadsetControl backend: running it, parsing its JSON
+├── notify.rs        sd_notify(3): READY, WATCHDOG, STOPPING
+├── maxwell/         the native Audeze Maxwell reader
+│   ├── mod.rs       the public face: `Reader`, `supports`, the IDs, finding the dongles
+│   ├── frame.rs     the dongle's report: the request, the frame, the messages in it
+│   ├── session.rs   one open dongle: link state, when to ask, the request budget
+│   └── discover.rs  the dongle in sysfs, and the wired headset next to it
+└── bridge/          the daemon's loop
+    ├── mod.rs       `Bridge`, `Config`, the `Uhid` seam and `DevicePool`
+    ├── batteries.rs the virtual batteries and what is known about each
+    ├── policy.rs    the pure decisions: vetting a level, the graces, the cadence
+    └── tests.rs     the bridge driven over a scripted source and a fake kernel
+```
+
+Each file keeps the tests of what it holds; the frames captured from a real
+dongle live in `maxwell/frame.rs`, and the session tests borrow them.
+
 The CLI tests drive the binary against a stub `headsetcontrol`, so they run
 anywhere. The native reader is tested on frames captured from a real dongle,
 on `/dev/null` standing in for the node, and on a fake sysfs for the dongle
@@ -332,7 +370,7 @@ virtual battery and reading it back from sysfs in
 
 ### How the core is tested
 
-The daemon's loop (`src/bridge.rs`) has two seams, and only two:
+The daemon's loop (`src/bridge/`) has two seams, and only two:
 
 * `BatterySource` is where readings come from - `Source` in the daemon, a
   scripted list of polls in the tests;
@@ -379,6 +417,22 @@ release workflow does not write to it. Bump `version` in `Cargo.toml` (and
 `Cargo.lock`) in a pull request; once merged, run *Actions → Release*. It tests,
 builds, tags `v<version>` and publishes the GitHub release with the binary
 attached - and refuses to run if that tag already exists.
+
+The binary is built for `x86_64-unknown-linux-musl` and statically linked:
+nothing in the dependency tree links C code (`rustix` goes through
+`linux-raw-sys`, the `libc` crate behind `signal-hook` is bound to musl's own,
+and the rest is pure Rust), so the one file runs on any x86_64 Linux without
+caring about its glibc. The workflow checks that `file` reports it as static
+before attaching it, next to a `SHA256SUMS` in the format `sha256sum` reads:
+
+```sh
+curl -LO https://github.com/GregDuhamel/HeadsetBatteryIndicator/releases/latest/download/headset-battery-indicator-x86_64-linux
+curl -LO https://github.com/GregDuhamel/HeadsetBatteryIndicator/releases/latest/download/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+`--ignore-missing` keeps `sha256sum` quiet about any file listed that was not
+downloaded; the line that matters reads `headset-battery-indicator-x86_64-linux: OK`.
 
 ## Troubleshooting
 

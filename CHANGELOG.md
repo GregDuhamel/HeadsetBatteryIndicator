@@ -5,6 +5,37 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-10-09
+
+The two large modules are split into directories, and the release binary is
+static. Nothing changes at runtime: same readings, same log lines, same
+command line, same 74 tests under the same names.
+
+### Changed
+
+- `src/maxwell.rs` is `src/maxwell/`: `mod.rs` keeps the public face
+  (`Reader`, `supports`, the IDs, `discover`), `frame.rs` the dongle's report
+  (the request, `fresh`, `messages`, `fetch`, and the tests on captured
+  frames), `session.rs` one open dongle (`Session`, `Link`, `should_ask`, the
+  `ASK_*` request budget, `AccessWatch` and the access-error lines), and
+  `discover.rs` the dongle in sysfs (`Dongle`, `discover_in`,
+  `headset_is_wired`). Every comment and every test moved with its code; the
+  session tests borrow the captured frames from `frame.rs`.
+- `src/bridge.rs` is `src/bridge/`: `mod.rs` keeps `Bridge`, `Config`, the
+  `Uhid` seam and `DevicePool`; `batteries.rs` the virtual batteries and
+  their bookkeeping (`Batteries`, `VirtualBattery`); `policy.rs` the pure
+  decisions (`vet`, `second_opinion`, `withdrawal`, `next_delay`, `note`, the
+  plausibility and retry constants) with their tests; and `tests.rs` the
+  bridge driven over the scripted source and the fake kernel. The public API
+  of both modules is unchanged, item for item (checked against rustdoc).
+- The release workflow builds `x86_64-unknown-linux-musl`, statically linked,
+  and refuses to attach a binary `file` does not report as static. Nothing in
+  the dependency tree links C code, so the one file runs on any x86_64 Linux
+  whatever its glibc. A `SHA256SUMS` is attached next to it; the README's
+  *Releasing* section says how to check it, and *Install* how to feed the
+  downloaded binary to `install.sh`.
+- README: a *Source layout* section under *Development*.
+
 ## [0.4.0] - 2026-10-09
 
 The daemon's loop is now tested end to end without hardware or `/dev/uhid`,
@@ -150,6 +181,7 @@ Review fixes of the first phase.
 notes are on the
 [GitHub releases page](https://github.com/GregDuhamel/HeadsetBatteryIndicator/releases).
 
+[0.5.0]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.2.1...v0.2.2
