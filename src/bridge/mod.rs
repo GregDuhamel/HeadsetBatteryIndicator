@@ -585,18 +585,9 @@ impl<S: BatterySource, U: Uhid> Bridge<S, U> {
         battery.gone_since = None;
 
         let known = device.reading();
-        let confirming = second_opinion(battery.deferred, battery.deferred_sample, headset.sample);
-        if vet(known.percent, reading.percent, confirming) == Verdict::Defer {
-            debug!(
-                "{}: holding back an implausible {}% (last known {}%)",
-                battery.name, reading.percent, known.percent
-            );
-            battery.deferred = Some(reading.percent);
-            battery.deferred_sample = headset.sample;
+        let Some(reading) = vetted(battery, known, reading, headset.sample) else {
             return Ok(());
-        }
-        battery.deferred = None;
-        battery.deferred_sample = None;
+        };
 
         // An unchanged level is still pushed now and then. The kernel drops input
         // reports without telling anyone while it is probing the device, so
@@ -749,6 +740,7 @@ impl<S: BatterySource, U: Uhid> Bridge<S, U> {
                 gone_since: None,
                 deferred: None,
                 deferred_sample: None,
+                held: None,
                 logged_percent: reading.percent,
                 published_at: now,
                 failures: 0,
@@ -833,4 +825,48 @@ impl<S: BatterySource, U: Uhid> Bridge<S, U> {
             drop(device.destroy());
         }
     }
+}
+
+/// Runs a reading through [`vet`], against the reading `known` to the kernel,
+/// and keeps the record a deferral or a hold needs. `None` when the reading
+/// waits for a second opinion; otherwise what to publish - the reading, or
+/// `known` again when the reading is held.
+///
+/// A held reading does not stop the republishing: the gauge may insist for
+/// hours, and the safety net is for the level the applet shows.
+fn vetted(
+    battery: &mut VirtualBattery,
+    known: Reading,
+    reading: Reading,
+    sample: Option<u64>,
+) -> Option<Reading> {
+    let confirming = second_opinion(battery.deferred, battery.deferred_sample, sample);
+    let reading = match vet(known, reading, confirming) {
+        Verdict::Defer => {
+            debug!(
+                "{}: holding back an implausible {}% (last known {}%)",
+                battery.name, reading.percent, known.percent
+            );
+            battery.deferred = Some(reading.percent);
+            battery.deferred_sample = sample;
+            return None;
+        }
+        Verdict::Hold => {
+            if battery.held != Some(reading.percent) {
+                debug!(
+                    "{}: reading {}% above the published {}% while discharging: held",
+                    battery.name, reading.percent, known.percent
+                );
+                battery.held = Some(reading.percent);
+            }
+            known
+        }
+        Verdict::Accept => {
+            battery.held = None;
+            reading
+        }
+    };
+    battery.deferred = None;
+    battery.deferred_sample = None;
+    Some(reading)
 }

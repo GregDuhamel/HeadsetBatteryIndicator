@@ -5,6 +5,8 @@
 
 use std::time::{Duration, Instant};
 
+use uhid_battery::Reading;
+
 use super::Config;
 
 /// How often the native reader is run. It only listens to the dongle - nothing
@@ -25,6 +27,10 @@ const UNANSWERED_RETRY: Duration = Duration::from_secs(3);
 /// is enough to make the desktop shout about a critical battery. No headset
 /// moves fifteen points in one polling interval, so a jump that large is either
 /// noise or a genuine change that will still be there on the next poll.
+///
+/// The same bound separates a gauge settling from a battery that was filled:
+/// see [`vet`]. A rise within it, while discharging, is never shown; a larger
+/// one is believed once confirmed.
 const MAX_PLAUSIBLE_STEP: u8 = 15;
 
 /// How close a confirmation has to be to the reading it confirms.
@@ -115,52 +121,196 @@ pub(super) enum Verdict {
     Accept,
     /// The reading is too far off to be trusted on its own.
     Defer,
+    /// The reading is believable but above the published level while the
+    /// headset is discharging: the gauge settling, not the battery filling.
+    /// The published level stands.
+    Hold,
 }
 
-/// Vets `candidate` against the level we last published, and against the
+/// Vets `candidate` against the reading we last published, and against the
 /// reading we deferred on the previous poll, if any.
-pub(super) fn vet(published: u8, candidate: u8, deferred: Option<u8>) -> Verdict {
-    if published.abs_diff(candidate) <= MAX_PLAUSIBLE_STEP {
-        return Verdict::Accept;
+///
+/// Two rules, one bound. A level further than [`MAX_PLAUSIBLE_STEP`] from the
+/// published one is deferred until a second reading confirms it, whichever
+/// way it goes. Within that bound a drop is taken at face value, and so is any
+/// move while charging or just off the cable; but a *rise while discharging*
+/// is held, and the published level - the lowest seen since the last charge -
+/// stands. A discharging battery does not fill up, and what the gauge reports
+/// after the headset wakes is a recalibration: an Audeze Maxwell answered
+/// 59%, 60%, 62%, 59% in two minutes and then stayed at 59% - published as
+/// read, that is an applet going up and down for nothing.
+///
+/// The exceptions, in order of the code:
+///
+/// - A rise beyond the bound is deferred, not held, and published once a
+///   second reading confirms it. The headset may have been charged while it
+///   was off or out of range for a moment too short to lose its entry, or the
+///   gauge may have been badly wrong; either way, a gauge that insists on
+///   twenty more points knows better than this rule. The bound is the one
+///   [`vet`] already uses, and for the same reason: no headset moves fifteen
+///   points in one interval, so a rise within it cannot be told from the
+///   gauge settling - while one beyond it already pays the confirmation toll
+///   and is then taken whole. The price is a short top-up shown late: a
+///   headset charged ten points while off is shown at its old level until
+///   the real one comes down to it, never more than the bound too low.
+/// - A reading while charging is never held - the level goes up on the
+///   cable - and neither is the first reading after one: a headset that only
+///   reports its level once unplugged tells the truth then, and a published
+///   `charging` reading is the mark that a charge happened.
+///
+/// A headset that disappears long enough to lose its virtual battery starts
+/// afresh from its first reading when it comes back; the rule does not reach
+/// across that.
+pub(super) fn vet(published: Reading, candidate: Reading, deferred: Option<u8>) -> Verdict {
+    if published.percent.abs_diff(candidate.percent) > MAX_PLAUSIBLE_STEP {
+        return match deferred {
+            // The same surprising level twice in a row is a real change: a
+            // laptop that slept for a night comes back to a genuinely emptier
+            // headset, or to one that was charged in the meantime.
+            Some(previous) if previous.abs_diff(candidate.percent) <= CONFIRM_TOLERANCE => {
+                Verdict::Accept
+            }
+            _ => Verdict::Defer,
+        };
     }
-    match deferred {
-        // The same surprising level twice in a row is a real change: a laptop
-        // that slept for a night comes back to a genuinely emptier headset.
-        Some(previous) if previous.abs_diff(candidate) <= CONFIRM_TOLERANCE => Verdict::Accept,
-        _ => Verdict::Defer,
+    let discharging = !candidate.charging && !published.charging;
+    if discharging && candidate.percent > published.percent {
+        return Verdict::Hold;
     }
+    Verdict::Accept
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Running on battery, at this level.
+    fn on(percent: u8) -> Reading {
+        Reading::new(percent, false)
+    }
+
+    /// On the cable, at this level.
+    fn wired(percent: u8) -> Reading {
+        Reading::new(percent, true)
+    }
+
+    /// What a series of readings gets published as, through the bookkeeping
+    /// `apply` keeps around `vet`: the first reading creates the device and is
+    /// published as is; each later one is vetted against the published
+    /// reading and the deferred one, a deferral is remembered for the next
+    /// poll, and a hold publishes nothing. Readings are fresh (no sample), so
+    /// a deferred reading is confirmed by the next poll that repeats it.
+    fn published(series: &[Reading]) -> Vec<Reading> {
+        let (first, rest) = series.split_first().expect("a first reading");
+        let mut published = vec![*first];
+        let mut deferred = None;
+        for &candidate in rest {
+            let known = *published.last().expect("the first reading");
+            match vet(known, candidate, deferred) {
+                Verdict::Accept => {
+                    deferred = None;
+                    if candidate != known {
+                        published.push(candidate);
+                    }
+                }
+                Verdict::Hold => deferred = None,
+                Verdict::Defer => deferred = Some(candidate.percent),
+            }
+        }
+        published
+    }
+
     #[test]
     fn small_moves_are_taken_at_face_value() {
-        assert_eq!(vet(92, 91, None), Verdict::Accept);
-        assert_eq!(vet(92, 92, None), Verdict::Accept);
-        assert_eq!(vet(50, 65, None), Verdict::Accept);
+        assert_eq!(vet(on(92), on(91), None), Verdict::Accept);
+        assert_eq!(vet(on(92), on(92), None), Verdict::Accept);
         // Exactly at the limit.
-        assert_eq!(vet(92, 77, None), Verdict::Accept);
+        assert_eq!(vet(on(92), on(77), None), Verdict::Accept);
+        // A rise is fine on the cable.
+        assert_eq!(vet(wired(50), wired(65), None), Verdict::Accept);
+        assert_eq!(vet(on(50), wired(65), None), Verdict::Accept);
+    }
+
+    #[test]
+    fn while_discharging_a_rise_within_the_step_is_held() {
+        assert_eq!(vet(on(59), on(60), None), Verdict::Hold);
+        assert_eq!(vet(on(59), on(62), None), Verdict::Hold);
+        // Up to the bound: beyond it the second opinion takes over.
+        assert_eq!(vet(on(59), on(74), None), Verdict::Hold);
+        assert_eq!(vet(on(59), on(75), None), Verdict::Defer);
+        // A drop is never held, nor is the same level.
+        assert_eq!(vet(on(59), on(58), None), Verdict::Accept);
+        assert_eq!(vet(on(59), on(59), None), Verdict::Accept);
+        // Plugging in at the same level is a change, not a rise.
+        assert_eq!(vet(on(59), wired(59), None), Verdict::Accept);
+    }
+
+    #[test]
+    fn the_gauge_settling_after_wake_up_is_published_once() {
+        // Observed on 2026-10-09: the dongle answered 59%, 60%, 62%, 59% in
+        // two minutes after the headset woke, then stayed at 59%. Published
+        // as read, the applet went up and down for nothing.
+        assert_eq!(
+            published(&[on(59), on(60), on(62), on(59), on(59)]),
+            [on(59)]
+        );
+        // The real discharge goes through as before.
+        assert_eq!(
+            published(&[on(59), on(62), on(58), on(60), on(57)]),
+            [on(59), on(58), on(57)]
+        );
+    }
+
+    #[test]
+    fn a_large_rise_confirmed_by_the_next_poll_is_a_charge_we_missed() {
+        // Charged while out of range: the gauge knows better than the rule,
+        // once it has said so twice.
+        assert_eq!(vet(on(59), on(80), None), Verdict::Defer);
+        assert_eq!(vet(on(59), on(80), Some(80)), Verdict::Accept);
+        assert_eq!(published(&[on(59), on(80), on(80)]), [on(59), on(80)]);
+        // Said once and then taken back: nothing published, and the reading
+        // that took it back is a rise too, so it is held.
+        assert_eq!(published(&[on(59), on(80), on(62), on(59)]), [on(59)]);
+    }
+
+    #[test]
+    fn a_charge_resets_the_rule() {
+        // On the cable the level goes up, and once off it the first reading
+        // is taken whole: a headset that reports no level while charging only
+        // tells the new one then.
+        assert_eq!(
+            published(&[on(59), wired(70), on(69)]),
+            [on(59), wired(70), on(69)]
+        );
+        assert_eq!(
+            published(&[on(59), wired(59), on(72), on(71)]),
+            [on(59), wired(59), on(72), on(71)]
+        );
+        // And from then on the rule applies again.
+        assert_eq!(
+            published(&[on(59), wired(70), on(69), on(71), on(68)]),
+            [on(59), wired(70), on(69), on(68)]
+        );
     }
 
     #[test]
     fn the_glitches_an_audeze_maxwell_actually_produces_are_held_back() {
         // Observed on a real dongle: 92%, 0%, 92% within eighteen seconds.
-        assert_eq!(vet(92, 0, None), Verdict::Defer);
+        assert_eq!(vet(on(92), on(0), None), Verdict::Defer);
         // And 92%, 44%, 92%.
-        assert_eq!(vet(92, 44, None), Verdict::Defer);
+        assert_eq!(vet(on(92), on(44), None), Verdict::Defer);
         // The value that follows the glitch is back in range, so it is taken,
         // and nothing bogus was ever published.
-        assert_eq!(vet(92, 92, Some(0)), Verdict::Accept);
+        assert_eq!(vet(on(92), on(92), Some(0)), Verdict::Accept);
     }
 
     #[test]
     fn a_large_change_confirmed_by_the_next_poll_is_accepted() {
         // A machine that slept all night comes back to an emptier headset:
         // the first reading waits, the second one confirms it.
-        assert_eq!(vet(92, 40, None), Verdict::Defer);
-        assert_eq!(vet(92, 38, Some(40)), Verdict::Accept);
+        assert_eq!(vet(on(92), on(40), None), Verdict::Defer);
+        assert_eq!(vet(on(92), on(38), Some(40)), Verdict::Accept);
+        assert_eq!(published(&[on(92), on(40), on(38)]), [on(92), on(38)]);
     }
 
     #[test]
@@ -170,13 +320,13 @@ mod tests {
         // the same reading, not a confirmation.
         assert_eq!(second_opinion(Some(0), Some(7), Some(7)), None);
         assert_eq!(
-            vet(92, 0, second_opinion(Some(0), Some(7), Some(7))),
+            vet(on(92), on(0), second_opinion(Some(0), Some(7), Some(7))),
             Verdict::Defer
         );
         // A new reading saying the same thing is one.
         assert_eq!(second_opinion(Some(0), Some(7), Some(8)), Some(0));
         assert_eq!(
-            vet(92, 0, second_opinion(Some(0), Some(7), Some(8))),
+            vet(on(92), on(0), second_opinion(Some(0), Some(7), Some(8))),
             Verdict::Accept
         );
         // A reader that reads afresh on every poll has no samples to compare:
@@ -188,8 +338,8 @@ mod tests {
 
     #[test]
     fn a_second_unrelated_glitch_does_not_confirm_the_first() {
-        assert_eq!(vet(92, 0, None), Verdict::Defer);
-        assert_eq!(vet(92, 44, Some(0)), Verdict::Defer);
+        assert_eq!(vet(on(92), on(0), None), Verdict::Defer);
+        assert_eq!(vet(on(92), on(44), Some(0)), Verdict::Defer);
     }
 
     #[test]
