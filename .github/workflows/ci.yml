@@ -1,5 +1,10 @@
 name: CI
 
+# rustfmt, clippy, build and tests (unit, integration, doc) on stable and on
+# the MSRV, rustdoc and cargo audit, all with warnings denied: the Rust CI
+# shared by this author's repositories, kept in uhid-battery. The packaging
+# and shellcheck jobs are this daemon's own.
+
 on:
   push:
     branches: [main]
@@ -10,43 +15,17 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-
 # The token only needs to read the repository: no job here writes anything.
 permissions:
   contents: read
 
 jobs:
-  test:
-    name: Test (${{ matrix.rust }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # The second entry is the MSRV declared in Cargo.toml.
-        rust: [stable, "1.85"]
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust ${{ matrix.rust }}
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.rust }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.rust }}
-
-      - name: Build
-        run: cargo build --locked --all-targets
-
-      - name: Test
-        run: cargo test --locked --all-targets
-
-      - name: Doc tests
-        run: cargo test --locked --doc
+  rust:
+    uses: GregDuhamel/uhid-battery/.github/workflows/rust-ci.yml@main
+    with:
+      # The MSRV declared in Cargo.toml.
+      msrv: "1.85"
+      all-features: true
 
   packaging:
     name: Packaging
@@ -80,3 +59,10 @@ jobs:
           headset-battery-indicator --version
           headset-battery-indicator --help
           ./install.sh --help
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: shellcheck install.sh
