@@ -299,6 +299,15 @@ headset moves that far in one interval, so such a jump is either noise — which
 never reaches UPower — or a real change, such as a machine coming back from a
 night of sleep, which costs one extra poll before it shows up.
 
+And while discharging the published level never rises: the gauge recalibrates
+after the headset wakes — a Maxwell answered `59%`, `60%`, `62%`, `59%` within
+two minutes, then stayed at `59%` — and a battery running down does not fill
+up, so a higher reading within those 15 points is held and the lowest level
+seen since the last charge stands. A rise beyond 15 points goes through the
+confirmation above and is then believed (the headset was charged while it was
+out of range); a reading while charging, or the first one after, is taken as
+is, since a charge is exactly when the level goes up.
+
 Small moves are logged at debug level rather than info, so a headset hovering
 between 91% and 92% does not fill the journal; `journalctl -u
 headset-battery-indicator -f` with `-v` in `ExecStart=` shows everything.
@@ -413,7 +422,9 @@ seconds of grace cost nothing. Covered that way: the first reading creating
 the device and the republish every 60 s, the 3 s a "headset gone" has to
 hold, the retry a minute later when the kernel builds no power supply, a
 charging headset with no level keeping the last one, the second opinion a
-large jump needs (and a cached reading not counting as one), the offline and
+large jump needs (and a cached reading not counting as one), a rise while
+discharging being held and the republish sending the published level rather
+than the held one (and a charge letting the level rise again), the offline and
 missing graces, three failed services or pushes destroying the device and the
 attach path bringing it back, an identity the kernel can never accept being
 given up on once, every battery withdrawn at shutdown with `READY=1` and

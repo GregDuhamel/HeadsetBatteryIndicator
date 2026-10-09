@@ -450,6 +450,64 @@ mod live {
     }
 
     #[test]
+    fn while_discharging_the_gauge_settling_upward_never_reaches_the_kernel() {
+        let mut bridge = bridge();
+        let start = Instant::now();
+
+        // Observed on 2026-10-09, after the headset woke: 59%, 60%, 62%,
+        // 59% within two minutes, then 59% for good. Only the 59% is
+        // pushed, once.
+        bridge.poll(vec![sampled(59, 1)], start);
+        assert_eq!(bridge.kernel(0).sent_all()[1..], [report(59, false)]);
+        bridge.poll(vec![sampled(60, 2)], start + seconds(30));
+        bridge.poll(vec![sampled(62, 3)], start + seconds(50));
+        assert_eq!(bridge.kernel(0).sent_all(), []);
+        assert_eq!(bridge.batteries[0].held, Some(62));
+        assert_eq!(bridge.batteries[0].deferred, None, "it is not a glitch");
+
+        // The periodic republish sends the published level, not the one
+        // being held - the gauge is still saying 62%.
+        bridge.poll(vec![sampled(62, 3)], start + REPUBLISH_EVERY);
+        assert_eq!(bridge.kernel(0).sent_all(), [report(59, false)]);
+        bridge.poll(vec![sampled(59, 4)], start + seconds(90));
+        assert_eq!(bridge.kernel(0).sent_all(), []);
+        assert_eq!(bridge.batteries[0].held, None);
+
+        // The discharge itself goes through at once, as before.
+        bridge.poll(vec![sampled(58, 5)], start + seconds(100));
+        assert_eq!(bridge.kernel(0).sent_all(), [report(58, false)]);
+        assert_eq!(bridge.batteries.len(), 1);
+    }
+
+    #[test]
+    fn a_charge_lets_the_level_rise_again() {
+        let mut bridge = bridge();
+        let start = Instant::now();
+        bridge.poll(vec![maxwell(BatteryState::Discharging(59))], start);
+        bridge.drain(0);
+
+        // Plugged in, no level reported: the last level, charging. Then
+        // unplugged, fuller: the first reading off the cable is taken whole.
+        bridge.poll(
+            vec![maxwell(BatteryState::Charging(None))],
+            start + seconds(1),
+        );
+        assert_eq!(bridge.kernel(0).sent_all(), [report(59, true)]);
+        bridge.poll(
+            vec![maxwell(BatteryState::Discharging(72))],
+            start + seconds(2),
+        );
+        assert_eq!(bridge.kernel(0).sent_all(), [report(72, false)]);
+        // And from there the rule applies again.
+        bridge.poll(
+            vec![maxwell(BatteryState::Discharging(74))],
+            start + seconds(3),
+        );
+        assert_eq!(bridge.kernel(0).sent_all(), []);
+        assert_eq!(bridge.batteries[0].held, Some(74));
+    }
+
+    #[test]
     fn a_silent_headset_is_withdrawn_after_the_offline_grace() {
         let mut bridge = bridge();
         let config = bridge.config.clone();

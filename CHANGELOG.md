@@ -5,6 +5,37 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-10-09
+
+While discharging, the published level never rises.
+
+### Changed
+
+- A reading above the published level, while the headset is discharging, is
+  held and the published level stands: the lowest seen since the last charge.
+  On 2026-10-09 the dongle answered 59%, 60%, 62%, 59% in the two minutes
+  after the headset woke, then 59% for good - the gauge recalibrates upward
+  after power-on - and every value was published, so the applet went up and
+  down for nothing; the vetting only caught jumps of 15 points or more. The
+  held reading is logged at debug (*"reading 62% above the published 59%
+  while discharging: held"*), once per level rather than on every tick, and
+  the periodic republish sends the published level, not the held one. Two
+  exceptions: a rise of more than 15 points goes through the existing second
+  opinion and is published once confirmed, since a gauge that insists on
+  twenty more points has seen a charge this daemon did not (the headset was
+  off or out of range for a moment); and a reading while charging, or the
+  first one after a charge, is taken as is - the level legitimately rises on
+  the cable, and a headset that reports no level while charging only tells
+  the new one once unplugged. A headset away long enough to lose its entry
+  starts afresh from its first reading when it is back; the rule does not
+  reach across that. `vet` now takes the published and candidate `Reading`s
+  and answers `Hold` besides `Accept` and `Defer`; drops and the second
+  opinion are as before. Tested as a pure function (the series observed,
+  59 → 80 → 80 published as 80, 59 → charging 70 → 69 published as 70 then
+  69) and on the fake kernel (one `Input2` at 59 for the series observed,
+  the republish at 59 while the gauge says 62, a charge letting the level
+  rise).
+
 ## [0.6.0] - 2026-10-09
 
 The daemon now tells a wedged dongle from a headset that is switched off, and
@@ -224,6 +255,7 @@ Review fixes of the first phase.
 notes are on the
 [GitHub releases page](https://github.com/GregDuhamel/HeadsetBatteryIndicator/releases).
 
+[0.6.1]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.3.0...v0.4.0

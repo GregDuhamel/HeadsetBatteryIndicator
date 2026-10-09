@@ -30,6 +30,10 @@ pub(super) struct VirtualBattery {
     /// and which reading that was.
     pub(super) deferred: Option<u8>,
     pub(super) deferred_sample: Option<u64>,
+    /// A level above the published one that the headset reports while
+    /// discharging, kept out of sight (see `policy::vet`) - and logged once,
+    /// not on every tick of a gauge that insists.
+    pub(super) held: Option<u8>,
     /// The level the last INFO line mentioned.
     pub(super) logged_percent: u8,
     /// When a reading was last pushed to the kernel.
