@@ -16,7 +16,14 @@ use crate::maxwell;
 
 /// Default for how often the native reader asks a linked headset for its level,
 /// in seconds.
-pub const DEFAULT_NATIVE_INTERVAL_SECS: u64 = 60;
+///
+/// Five minutes. The Maxwell's battery lasts some eighty hours, so it loses a
+/// percent every fifty minutes or so: five questions an hour resolve every
+/// step of it with margin, and the dongle volunteers the level whenever the
+/// headset connects anyway. Each question is also a risk - requests that go
+/// unanswered are what wedges the dongle (see [`maxwell`]) - so the fewer the
+/// better. It was sixty seconds, which bought nothing but exposure.
+pub const DEFAULT_NATIVE_INTERVAL_SECS: u64 = 300;
 
 /// How long a vanished dongle is given to re-enumerate before HeadsetControl is
 /// tried instead. It takes two or three seconds.
@@ -133,6 +140,14 @@ impl Source {
         } else {
             Ok(native)
         }
+    }
+
+    /// Whether the dongle the last [`Source::probe_once`] opened looks wedged:
+    /// silent, yet streaming sound (see [`maxwell::Reader::looks_wedged`]).
+    /// Never through HeadsetControl, which has no such tell.
+    #[must_use]
+    pub fn looks_wedged(&self) -> bool {
+        self.backend != Backend::HeadsetControl && self.reader.looks_wedged()
     }
 }
 

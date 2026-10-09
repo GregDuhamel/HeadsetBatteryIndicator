@@ -210,7 +210,7 @@ headset-battery-indicator run [OPTIONS]
 
   -i, --interval <SECONDS>     Delay between two readings through headsetcontrol [default: 60]
       --native-interval <SECONDS>
-                               How often the native reader asks a linked headset for its level [default: 60]
+                               How often the native reader asks a linked headset for its level [default: 300]
       --offline-grace <SECONDS>
                                How long a detected but silent headset keeps its entry [default: 10]
       --missing-grace <SECONDS>
@@ -245,8 +245,10 @@ the graces above apply.
 
 It fetches the dongle's report once a second - a control transfer to the dongle,
 nothing goes over the air - and only asks for the level while the headset is
-linked (every `--native-interval`, 60 s), plus at most three times per opened
-node to learn where things stand.
+linked (every `--native-interval`, 300 s), plus at most three times per opened
+node to learn where things stand. Five minutes is plenty: the Maxwell's
+battery lasts some eighty hours, so it loses a percent every fifty minutes or
+so, and the dongle volunteers the level whenever the headset connects anyway.
 
 That restraint is not politeness. An earlier version asked every ten seconds
 whether or not the headset was there. After an hour with the headset off -
@@ -264,6 +266,26 @@ wrongly given up on, is still found.
 The dongle also re-enumerates on USB a second or two after every link change,
 so its hidraw node vanishes and comes back. The daemon reopens it, carries what
 it knew across, and does not fall back to HeadsetControl for that gap.
+
+### When the dongle wedges anyway
+
+From the HID side a wedged dongle and a headset that is switched off look the
+same: nothing comes back. The tell is on the audio side. The dongle's USB
+audio interfaces - and the ALSA card they make - only exist while a headset
+is linked, and a playback stream in `RUNNING` state means sound is going to a
+headset that is there. So once the dongle has said nothing for ten minutes
+(long enough for the slow cadence above to have asked it at least once) the
+daemon finds the dongle's card through sysfs and reads
+`/proc/asound/cardN/pcm*p/sub0/status`, at most every thirty seconds; if
+sound is playing, it warns:
+
+```
+the Audeze dongle is streaming audio but has answered nothing for 3h: it is most likely wedged — unplug and replug the dongle (power-cycling the headset is not enough)
+```
+
+Once, then once a day while it lasts, and `the dongle answers again` when it
+is over. It never sends the dongle anything more to find out - more requests
+are what wedges it. See [Troubleshooting](#troubleshooting) for what to do.
 
 ## Noisy readings
 
@@ -348,7 +370,8 @@ src/
 │   ├── mod.rs       the public face: `Reader`, `supports`, the IDs, finding the dongles
 │   ├── frame.rs     the dongle's report: the request, the frame, the messages in it
 │   ├── session.rs   one open dongle: link state, when to ask, the request budget
-│   └── discover.rs  the dongle in sysfs, and the wired headset next to it
+│   ├── discover.rs  the dongle in sysfs, and the wired headset next to it
+│   └── wedge.rs     a wedged dongle told from a headset that is off: the ALSA evidence, when to say so
 └── bridge/          the daemon's loop
     ├── mod.rs       `Bridge`, `Config`, the `Uhid` seam and `DevicePool`
     ├── batteries.rs the virtual batteries and what is known about each
@@ -361,8 +384,9 @@ dongle live in `maxwell/frame.rs`, and the session tests borrow them.
 
 The CLI tests drive the binary against a stub `headsetcontrol`, so they run
 anywhere. The native reader is tested on frames captured from a real dongle,
-on `/dev/null` standing in for the node, and on a fake sysfs for the dongle
-filter. What talks to the real kernel is tested in the shared crates: reading
+on `/dev/null` standing in for the node, and on fake sysfs and `/proc/asound`
+trees for the dongle filter and the wedge detector (whose clock is passed
+in, so ten minutes of silence and a day's reminder cost nothing). What talks to the real kernel is tested in the shared crates: reading
 hidraw nodes in [hidraw](https://github.com/GregDuhamel/hidraw), creating a
 virtual battery and reading it back from sysfs in
 [uhid-battery](https://github.com/GregDuhamel/uhid-battery), as root.
@@ -455,6 +479,32 @@ node. Regenerate the rule while the dongle is plugged in:
 headset-battery-indicator udev-rules | sudo tee /etc/udev/rules.d/70-headset-battery-indicator.rules
 sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=hidraw
 ```
+
+**The headset works but UPower shows nothing.** Sound plays, yet the
+applet lists no headset, and the journal has been saying *"Audeze Maxwell is
+detected but not answering battery queries (switched off?)"* for a while.
+Look for this line (`journalctl -u headset-battery-indicator`):
+
+```
+the Audeze dongle is streaming audio but has answered nothing for 3h: it is most likely wedged — unplug and replug the dongle (power-cycling the headset is not enough)
+```
+
+or run `headset-battery-indicator status`, which prints `dongle: not
+answering, audio running — probably wedged` under the headset's entry when
+its one request goes unanswered while sound is playing.
+
+The dongle has wedged: its audio keeps working, but its status channel
+answers nothing - not a link event, not a battery answer, not a request
+addressed to the dongle itself - and its answer report is frozen, with an old
+battery answer still inside. (That frozen report is also why HeadsetControl
+keeps reporting a stale level from such a dongle: it scans the whole buffer,
+leftovers included.) The daemon cannot ask its way out of it: requests are
+what wedge the dongle in the first place, so it only watches and says so.
+
+The remedy is physical: **unplug the dongle and plug it back in.**
+Switching the headset off and on re-enumerates the dongle on USB but does not
+clear the wedge. The journal then says `the dongle answers again`, and the
+entry is back within a few seconds.
 
 **`out of inherited /dev/uhid descriptors`.** You have more than one headset;
 add an `OpenFile=/dev/uhid:uhid2` line to the unit — the daemon takes every

@@ -54,13 +54,16 @@ PrivateNetwork=yes
 IPAddressDeny=any
 # libudev, which headsetcontrol uses to enumerate hidraw nodes, talks to
 # systemd-udevd over a local socket. The native reader needs neither: it reads
-# /sys/class/hidraw and /sys/bus/usb/devices directly.
+# /sys/class/hidraw, /sys/bus/usb/devices and /proc/asound directly.
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 ProtectProc=invisible
-ProcSubset=pid
+# Not ProcSubset=pid: it hides everything in /proc but the processes, and the
+# native reader reads /proc/asound/cardN/pcm*p/sub0/status to tell a wedged
+# dongle (streaming audio, answering nothing) from a headset that is off.
+# ProtectKernelTunables= below still makes /proc/sys and friends read-only.
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectKernelLogs=yes

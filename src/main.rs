@@ -276,6 +276,18 @@ fn status(source: &mut Source) -> Result<()> {
             "{} [{:04x}:{:04x}] via {}\n  battery: {battery}\n  sysfs:   {published}",
             headset.name, headset.vendor_id, headset.product_id, headset.product,
         )?;
+        // A dongle that answers nothing while streaming sound is wedged, not
+        // idle; the daemon's journal says since when (see the README's
+        // Troubleshooting).
+        if headset.vendor_id == headset_battery_indicator::maxwell::VENDOR_ID
+            && source.looks_wedged()
+        {
+            writeln!(
+                out,
+                "  dongle:  not answering, audio running — probably wedged; unplug and replug \
+                 the dongle (the daemon's journal says since when)"
+            )?;
+        }
     }
     Ok(())
 }
