@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] - 2026-10-29
+
+### Changed
+
+- Dependencies refreshed and the binary rebuilt with Rust 1.99; no code change.
+
 ## [0.6.1] - 2026-10-09
 
 While discharging, the published level never rises.
@@ -255,6 +261,7 @@ Review fixes of the first phase.
 notes are on the
 [GitHub releases page](https://github.com/GregDuhamel/HeadsetBatteryIndicator/releases).
 
+[0.6.2]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.4.0...v0.5.0
