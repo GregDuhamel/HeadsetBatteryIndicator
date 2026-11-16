@@ -559,6 +559,49 @@ mod live {
     }
 
     #[test]
+    fn a_fault_takes_the_place_of_the_headset_as_an_empty_battery_and_gives_it_back() {
+        let mut bridge = bridge();
+        let start = Instant::now();
+        bridge.poll(vec![maxwell(BatteryState::Discharging(80))], start);
+        bridge.drain(0);
+
+        // The reader now reports the same dongle as a fault, under a name
+        // that says what to do: the headset's entry goes at once - no grace,
+        // the two never sit side by side - and an empty battery of its own
+        // identity is published (on a handle of its own here: the fake hands
+        // out a new kernel every time).
+        let fault = headset("Dongle wedged - replug it", true, BatteryState::Fault);
+        bridge.poll(vec![fault.clone()], start + seconds(1));
+        assert_eq!(bridge.batteries.len(), 1);
+        assert_eq!(bridge.uhid.acquired, 2);
+        assert_eq!(bridge.kernel(0).sent_all(), [Sent::Destroy]);
+        let sent = bridge.kernel(1).sent_all();
+        let Sent::Create2 { name, uniq, .. } = &sent[0] else {
+            panic!("the fault was not published: {sent:?}");
+        };
+        assert_eq!(name, "Dongle wedged - replug it");
+        assert_eq!(uniq, "headset-3329-4b18-fault");
+        assert_eq!(sent[1..], [report(0, false)]);
+
+        // It stays for as long as the reader says so, without a word more.
+        bridge.poll(vec![fault], start + seconds(20));
+        assert_eq!(bridge.batteries.len(), 1);
+        assert_eq!(bridge.kernel(1).sent_all(), []);
+
+        // The dongle answers again and the headset has a level: the fault
+        // goes the same way, and the level is not vetted against its zero.
+        bridge.poll(
+            vec![maxwell(BatteryState::Discharging(80))],
+            start + seconds(21),
+        );
+        assert_eq!(bridge.batteries.len(), 1);
+        assert_eq!(bridge.kernel(1).sent_all(), [Sent::Destroy]);
+        let sent = bridge.kernel(2).sent_all();
+        assert!(matches!(&sent[0], Sent::Create2 { name, .. } if name == "Audeze Maxwell"));
+        assert_eq!(sent[1..], [report(80, false)]);
+    }
+
+    #[test]
     fn a_failing_reader_is_an_empty_poll_said_once() {
         let mut bridge = bridge();
         let start = Instant::now();

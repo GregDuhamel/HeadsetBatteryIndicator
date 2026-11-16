@@ -5,6 +5,67 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-11-16
+
+A wedged dongle is found within the half minute, by asking it.
+
+The dongle wedged again on 2026-11-01, and went unseen for two weeks again:
+the 0.6.0 detector only spoke while sound was playing, into a journal nobody
+reads. This time the wedged dongle was examined before it was unplugged, and
+the same dongle tested once replugged; the module documentation of
+`src/maxwell` has the findings.
+
+### Added
+
+- A liveness request. A battery request addressed to the dongle itself
+  (`06 07 00 05 5a 03 00 d6 0c`) never goes over the air; a dongle that is
+  alive answers it within 50 ms with `05 5b 03 00 d6 0c 02`, headset or no
+  headset, and a wedged one never does. The native reader sends it when it
+  starts and every five minutes; an unanswered one is retried twice, ten
+  seconds apart, and three in a row are a wedge. Anything the dongle writes
+  counts as an answer, understood or not.
+- The last forty-eight exchanges with the dongle - sessions opened, requests
+  sent, every report that carried something - are kept in memory and written
+  to the journal with the first warning of a wedge, each with its age. What
+  wedges the dongle is not known; this is what the next occurrence will have
+  to say about it. At `-vv` every non-empty report is logged as it comes.
+
+- A wedge shows on the desktop. While it lasts the dongle is published, in
+  place of the headset, as an empty battery named *"Audeze Maxwell dongle
+  wedged - replug it"* (`BatteryState::Fault`, under its own identifier
+  `headset-3329-4b18-fault`, so that the 0 % stays out of the headset's
+  charge history): the applet that showed the level shows that, and the
+  desktop's low-battery notification does the rest. A node opened during a
+  wedge is sent the liveness request at once instead of on the five-minute
+  cadence, so the alert is gone within seconds of the dongle being replugged.
+- The bridge keeps one entry per device: a headset a reader starts reporting
+  under another name replaces the entry it had, at once, instead of sitting
+  next to it until the missing grace - and holding the unit's only uhid
+  descriptor meanwhile.
+
+### Changed
+
+- The wedge warning no longer waits for ten minutes of silence with sound
+  playing: it comes some twenty-five seconds after the dongle stops
+  answering, or after the daemon starts on a dongle that is already wedged,
+  whether or not anything plays. It reads *"the Audeze dongle no longer
+  answers requests addressed to itself; it last said something 5min ago: it
+  is wedged — unplug and replug the dongle (power-cycling the headset is not
+  enough)"*. `status` prints *"dongle: not answering its own liveness request
+  — probably wedged"* on the same evidence.
+- The documentation no longer says that requests to a headset that is off
+  wedge the dongle. A freshly plugged dongle took 375 of them in twenty
+  seconds, then 4600 more across six link changes, and stayed alive; nor did
+  leaving 84 bytes of answers unfetched in its 59-byte buffer do more than
+  lose some. The request budget is unchanged.
+- The unit sets `ProcSubset=pid` again: nothing reads `/proc/asound` any more.
+
+### Removed
+
+- The ALSA evidence (`playback_running`, the sysfs walk from the hidraw node
+  to the USB device and its sound card): the liveness request answers the
+  question it could only suggest, and without sound having to play.
+
 ## [0.6.2] - 2026-10-29
 
 ### Changed
@@ -261,6 +322,7 @@ Review fixes of the first phase.
 notes are on the
 [GitHub releases page](https://github.com/GregDuhamel/HeadsetBatteryIndicator/releases).
 
+[0.7.0]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/GregDuhamel/HeadsetBatteryIndicator/compare/v0.5.0...v0.6.0

@@ -1,127 +1,97 @@
 //! Telling a wedged dongle from a headset that is switched off.
 //!
-//! From the HID side the two are the same: nothing comes back. The difference
-//! is on the audio side. The dongle's USB audio interfaces - and with them its
-//! ALSA card - only exist while a headset is linked, and a PCM of that card
-//! in `RUNNING` state means sound is being streamed to a headset that is
-//! there. A dongle that streams and still answers nothing is wedged. The
-//! [module documentation](super) tells the incident that taught this.
+//! To a reader that only listens the two are the same: nothing comes back.
+//! The difference shows when the dongle itself is asked something. A battery
+//! request addressed to the dongle rather than relayed to the headset
+//! ([`LIVENESS_REQUEST`](super::frame::LIVENESS_REQUEST)) never goes over the
+//! air; a dongle that is alive answers it within some 50 ms, headset or no
+//! headset, and a wedged one never does. The [module documentation](super)
+//! tells the incidents that taught this.
 //!
-//! Two parts: [`playback_running`], the evidence, a pure read of sysfs and
-//! `/proc/asound` with both roots given so that a fake tree can stand in; and
-//! [`WedgeWatch`], the decision - how long the silence has to last, how often
-//! the evidence is looked at, and when to say so again.
+//! Two parts: [`WedgeWatch`], the decisions - when a liveness request is due,
+//! when the silence means a wedge, and when to say so again - with every
+//! instant passed in, so that it is tested on instants of the test's
+//! choosing; and [`Trace`], the last exchanges with the dongle, kept so that
+//! the journal shows what led to a wedge when one is found.
 
-use std::ffi::OsString;
-use std::fs;
-use std::path::Path;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use log::debug;
+/// How often the dongle is asked whether it is alive. Five minutes dates a
+/// wedge to that precision, which is what finding its cause needs; the
+/// request stays in the dongle, so it costs the headset nothing.
+pub(super) const PROBE_EVERY: Duration = Duration::from_secs(300);
 
-use super::session::ASK_IDLE_RETRY;
+/// How long a liveness request is given. The answer takes some 50 ms and the
+/// reader fetches once a second; five seconds also covers the dongle
+/// re-enumerating in between, which takes two or three.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long a dongle has to say nothing before it is suspected. It matches
-/// the slow cadence of the session: a session that has heard nothing is asked
-/// again every ten minutes (`ASK_IDLE_RETRY`), so by the time the silence has
-/// lasted this long at least one request went out, and a dongle with a
-/// linked headset - which the audio proves - would have answered it.
-pub(super) const WEDGE_SILENCE: Duration = Duration::from_secs(600);
+/// How long after an unanswered liveness request the next one goes out, until
+/// [`MAX_UNANSWERED`] have been lost. An answer can be lost without the
+/// dongle being wedged - it re-enumerated, or another program fetched the
+/// report first - so one miss proves nothing and is checked again at once.
+const PROBE_RETRY: Duration = Duration::from_secs(10);
 
-// The reasoning above holds only while the silence outlasts the slow cadence.
-const _: () = assert!(WEDGE_SILENCE.as_secs() >= ASK_IDLE_RETRY.as_secs());
+// A retry must not go out while the previous request can still be answered.
+const _: () = assert!(PROBE_RETRY.as_secs() >= PROBE_TIMEOUT.as_secs());
+
+/// Liveness requests lost in a row before the dongle is called wedged.
+const MAX_UNANSWERED: u32 = 3;
 
 /// How long between two warnings about the same wedge. The remedy is a hand
 /// on the dongle; once a day is enough to be noticed without flooding the
 /// journal for the two weeks the first incident went unseen.
 pub(super) const WEDGE_REMINDER: Duration = Duration::from_secs(24 * 3600);
 
-/// How often the ALSA state is read while a wedge is suspected. The reader
-/// runs once a second; a few file reads every half minute is nothing, every
-/// second would be a habit.
-const PROBE_EVERY: Duration = Duration::from_secs(30);
-
-/// Whether the dongle's sound card has a playback stream running.
-///
-/// `usb_device` is the dongle's USB device directory in sysfs (`1-5`, say):
-/// its interfaces are `1-5:1.N`, and the one bound to `snd-usb-audio` holds
-/// `sound/cardN`. The card's playback PCMs are then `/proc/asound/cardN/
-/// pcm*p`, each with a `sub0/status` that reads `closed` at rest and starts
-/// with `state: RUNNING` while sound plays.
-///
-/// `Some(true)` when any playback PCM is running, `Some(false)` when the
-/// card is there and none is, and `None` when the device has no sound card
-/// (the interfaces go with the headset's link) or its PCMs cannot be read,
-/// which says nothing either way.
-pub(super) fn playback_running(proc_asound: &Path, usb_device: &Path) -> Option<bool> {
-    let card = sound_card(usb_device)?;
-    let card_dir = proc_asound.join(&card);
-    let pcms = match fs::read_dir(&card_dir) {
-        Ok(pcms) => pcms,
-        Err(err) => {
-            debug!("cannot list {}: {err}", card_dir.display());
-            return None;
-        }
-    };
-    let running = pcms
-        .filter_map(Result::ok)
-        .filter(|pcm| {
-            let name = pcm.file_name();
-            let name = name.to_string_lossy();
-            name.starts_with("pcm") && name.ends_with('p')
-        })
-        .any(|pcm| {
-            fs::read_to_string(pcm.path().join("sub0/status"))
-                .unwrap_or_default()
-                .lines()
-                .any(|line| line.trim() == "state: RUNNING")
-        });
-    Some(running)
+/// A wedge worth a warning now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Wedged {
+    /// How long ago the dongle last said anything.
+    pub(super) silence: Duration,
+    /// Whether this wedge was already reported, a day or more ago.
+    pub(super) reminder: bool,
 }
 
-/// The ALSA card directory name (`cardN`) under one of the USB device's
-/// interfaces, if any has one.
-fn sound_card(usb_device: &Path) -> Option<OsString> {
-    fs::read_dir(usb_device)
-        .ok()?
-        .filter_map(Result::ok)
-        .filter_map(|interface| fs::read_dir(interface.path().join("sound")).ok())
-        .flatten()
-        .filter_map(Result::ok)
-        .map(|entry| entry.file_name())
-        .find(|name| name.to_string_lossy().starts_with("card"))
-}
-
-/// The silence being watched, and whether it is worth a line yet.
+/// The dongle's liveness: when it last spoke, the request that checks it, and
+/// whether its silence has been reported.
 ///
 /// One per reader, not per session: the dongle re-enumerates at every link
 /// change, which opens a new session, and the silence is the dongle's, not
-/// the session's. Only the decisions live here; the logging is the reader's,
-/// so that this can be tested with instants of the test's choosing.
+/// the session's. Only the decisions live here; the request and the logging
+/// are the reader's.
 #[derive(Debug)]
 pub(super) struct WedgeWatch {
     /// When a dongle last said anything, or when the watch began.
     heard_at: Instant,
+    /// When the last liveness request went out.
+    probed_at: Option<Instant>,
+    /// Whether that request is still waiting for its answer.
+    pending: bool,
+    /// How many liveness requests in a row went unanswered.
+    unanswered: u32,
     /// When the wedge was last reported, if it was.
     warned_at: Option<Instant>,
-    /// The last look at the ALSA state, and when it was taken.
-    probed: Option<(Instant, Option<bool>)>,
 }
 
 impl WedgeWatch {
     pub(super) fn new(now: Instant) -> Self {
         Self {
             heard_at: now,
+            probed_at: None,
+            pending: false,
+            unanswered: 0,
             warned_at: None,
-            probed: None,
         }
     }
 
-    /// Takes in that a dongle said something, and says whether the recovery
-    /// is worth a line: only if the silence was reported.
+    /// Takes in that a dongle said something - anything: the answer to the
+    /// liveness request, or whatever else proves it alive - and says whether
+    /// the recovery is worth a line: only if the wedge was reported.
     pub(super) fn heard(&mut self, now: Instant) -> bool {
         self.heard_at = now;
-        self.probed = None;
+        self.pending = false;
+        self.unanswered = 0;
         self.warned_at.take().is_some()
     }
 
@@ -130,43 +100,122 @@ impl WedgeWatch {
         now.duration_since(self.heard_at)
     }
 
-    /// Takes in a pass over a dongle whose headset is not known to be linked,
-    /// and says whether a warning is due now, with the silence to quote.
-    ///
-    /// `probe` reads the ALSA state ([`playback_running`]); it is only called
-    /// once the silence has lasted [`WEDGE_SILENCE`], and then at most every
-    /// [`PROBE_EVERY`]. A warning is due the first time the dongle is found
-    /// streaming, and again every [`WEDGE_REMINDER`] while it stays silent.
-    pub(super) fn check(
-        &mut self,
-        now: Instant,
-        probe: impl FnOnce() -> Option<bool>,
-    ) -> Option<Duration> {
-        let silence = self.silence(now);
-        if silence < WEDGE_SILENCE {
-            return None;
-        }
-        let running = match self.probed {
-            Some((at, result)) if now.duration_since(at) < PROBE_EVERY => result,
-            _ => {
-                let result = probe();
-                self.probed = Some((now, result));
-                result
+    /// Whether a liveness request is due now: at once on the first pass, every
+    /// [`PROBE_EVERY`] after that, and [`PROBE_RETRY`] after one that was
+    /// lost, until enough were lost to call the dongle wedged. A request
+    /// still out for longer than [`PROBE_TIMEOUT`] is counted as lost here.
+    /// The caller sends the request and reports it with [`WedgeWatch::probed`].
+    pub(super) fn probe_due(&mut self, now: Instant) -> bool {
+        let since_probe = self.probed_at.map(|at| now.duration_since(at));
+        if self.pending {
+            if since_probe.is_some_and(|since| since < PROBE_TIMEOUT) {
+                return false;
             }
-        };
-        if running != Some(true) {
-            return None;
+            self.pending = false;
+            self.unanswered = self.unanswered.saturating_add(1);
         }
-        let due = self
-            .warned_at
-            .is_none_or(|at| now.duration_since(at) >= WEDGE_REMINDER);
-        if due {
-            self.warned_at = Some(now);
-            Some(silence)
+        let wait = if (1..MAX_UNANSWERED).contains(&self.unanswered) {
+            PROBE_RETRY
         } else {
-            None
+            PROBE_EVERY
+        };
+        since_probe.is_none_or(|since| since >= wait)
+    }
+
+    /// Takes in that a liveness request went out.
+    pub(super) fn probed(&mut self, now: Instant) {
+        self.probed_at = Some(now);
+        self.pending = true;
+    }
+
+    /// Whether a liveness request is out with nothing heard since. For the
+    /// one-shot reading of the `status` command, which has no time for three.
+    pub(super) fn unanswered_probe(&self) -> bool {
+        self.pending
+    }
+
+    /// Whether the dongle is taken for wedged: [`MAX_UNANSWERED`] liveness
+    /// requests in a row were lost, and nothing was heard since.
+    pub(super) fn is_wedged(&self) -> bool {
+        self.unanswered >= MAX_UNANSWERED
+    }
+
+    /// Takes in that a dongle's node was just opened. While the dongle is
+    /// taken for wedged that is worth a liveness request at once rather than
+    /// in five minutes: replugging the dongle - the remedy - is what makes a
+    /// new node, and the alert should not outlive the wedge by that long.
+    pub(super) fn reopened(&mut self) {
+        if self.is_wedged() {
+            self.pending = false;
+            self.probed_at = None;
         }
     }
+
+    /// Whether a warning is due now: the first time [`MAX_UNANSWERED`]
+    /// liveness requests in a row were lost, and again every
+    /// [`WEDGE_REMINDER`] while the dongle stays silent.
+    pub(super) fn wedged(&mut self, now: Instant) -> Option<Wedged> {
+        if self.unanswered < MAX_UNANSWERED {
+            return None;
+        }
+        let reminder = match self.warned_at {
+            None => false,
+            Some(at) if now.duration_since(at) >= WEDGE_REMINDER => true,
+            Some(_) => return None,
+        };
+        self.warned_at = Some(now);
+        Some(Wedged {
+            silence: self.silence(now),
+            reminder,
+        })
+    }
+}
+
+/// How many exchanges [`Trace`] keeps. A quiet dongle is one liveness request
+/// and its answer every five minutes, so this is a couple of hours of them -
+/// or the last minutes of a busy stretch, which is the part that matters.
+const TRACE_CAPACITY: usize = 48;
+
+/// The last exchanges with the dongle - sessions opened, requests sent, and
+/// every report that carried something - with when each happened.
+///
+/// It exists for the day the dongle wedges: nobody knows yet what does it,
+/// and by the time the wedge is noticed the journal has nothing on what
+/// preceded it. The reader writes this out with the warning.
+#[derive(Debug, Default)]
+pub(super) struct Trace {
+    events: VecDeque<(Instant, String)>,
+}
+
+impl Trace {
+    /// Adds an exchange, dropping the oldest once [`TRACE_CAPACITY`] are kept.
+    pub(super) fn record(&mut self, now: Instant, event: String) {
+        if self.events.len() == TRACE_CAPACITY {
+            self.events.pop_front();
+        }
+        self.events.push_back((now, event));
+    }
+
+    /// The exchanges kept, oldest first, each with how long before `now` it
+    /// happened.
+    pub(super) fn lines(&self, now: Instant) -> impl Iterator<Item = String> + '_ {
+        self.events.iter().map(move |(at, event)| {
+            format!(
+                "{:>8.1}s ago  {event}",
+                now.duration_since(*at).as_secs_f64()
+            )
+        })
+    }
+}
+
+/// The bytes of a report as they are written in the documentation and the
+/// tests: two hexadecimal digits each, separated by spaces.
+pub(super) fn hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A duration as a person would say it in a log line: `45s`, `10min`,
@@ -187,195 +236,209 @@ pub(super) fn human(duration: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-    use std::path::PathBuf;
-
     use super::*;
-
-    /// A fake pair of trees: the dongle's USB device `1-5` with a sound card
-    /// on its second interface, and `/proc/asound` next to it. Returns the
-    /// two roots and the device directory.
-    fn trees(card: Option<&str>) -> (tempfile::TempDir, PathBuf, PathBuf) {
-        let tmp = tempfile::tempdir().unwrap();
-        let proc_asound = tmp.path().join("proc");
-        let usb_device = tmp.path().join("sys/1-5");
-        fs::create_dir_all(usb_device.join("1-5:1.0")).unwrap();
-        fs::write(usb_device.join("idVendor"), "3329\n").unwrap();
-        fs::create_dir_all(&proc_asound).unwrap();
-        if let Some(card) = card {
-            fs::create_dir_all(usb_device.join("1-5:1.1/sound").join(card)).unwrap();
-        }
-        (tmp, proc_asound, usb_device)
-    }
-
-    fn pcm(proc_asound: &Path, card: &str, pcm: &str, status: &str) {
-        let dir = proc_asound.join(card).join(pcm).join("sub0");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("status"), status).unwrap();
-    }
-
-    const RUNNING: &str = "state: RUNNING\nowner_pid   : 2170\ntrigger_time: 1.2\n";
 
     /// A second short of `duration`.
     fn shy(duration: Duration) -> Duration {
         Duration::from_secs(duration.as_secs() - 1)
     }
 
-    #[test]
-    fn a_running_playback_pcm_is_the_evidence() {
-        let (_tmp, proc_asound, usb_device) = trees(Some("card3"));
-
-        // The card, nothing playing.
-        pcm(&proc_asound, "card3", "pcm0p", "closed\n");
-        pcm(&proc_asound, "card3", "pcm0c", "closed\n");
-        assert_eq!(playback_running(&proc_asound, &usb_device), Some(false));
-
-        // Sound plays.
-        pcm(&proc_asound, "card3", "pcm0p", RUNNING);
-        assert_eq!(playback_running(&proc_asound, &usb_device), Some(true));
-    }
-
-    #[test]
-    fn any_playback_pcm_counts_but_capture_does_not() {
-        let (_tmp, proc_asound, usb_device) = trees(Some("card3"));
-        pcm(&proc_asound, "card3", "pcm0p", "closed\n");
-        pcm(&proc_asound, "card3", "pcm1p", RUNNING);
-        pcm(&proc_asound, "card3", "pcm0c", "closed\n");
-        assert_eq!(playback_running(&proc_asound, &usb_device), Some(true));
-
-        // The microphone alone is not the headset listening.
-        pcm(&proc_asound, "card3", "pcm1p", "closed\n");
-        pcm(&proc_asound, "card3", "pcm0c", RUNNING);
-        assert_eq!(playback_running(&proc_asound, &usb_device), Some(false));
-    }
-
-    #[test]
-    fn no_card_says_nothing_either_way() {
-        // The dongle's audio interfaces go with the headset's link: without
-        // them there is no card, and nothing to conclude.
-        let (_tmp, proc_asound, usb_device) = trees(None);
-        pcm(&proc_asound, "card3", "pcm0p", RUNNING);
-        assert_eq!(playback_running(&proc_asound, &usb_device), None);
-        assert_eq!(
-            playback_running(&proc_asound, Path::new("/nonexistent/1-5")),
-            None
-        );
-
-        // A card that sysfs lists but /proc does not show (`ProcSubset=pid`
-        // hides /proc/asound) is not evidence of anything.
-        let (_tmp, proc_asound, usb_device) = trees(Some("card3"));
-        assert_eq!(playback_running(&proc_asound, &usb_device), None);
-    }
-
-    #[test]
-    fn the_silence_is_reported_once_it_has_lasted_then_once_a_day() {
-        let start = Instant::now();
-        let mut watch = WedgeWatch::new(start);
-        let probes = Cell::new(0);
-        let streaming = || {
-            probes.set(probes.get() + 1);
-            Some(true)
-        };
-
-        // Under ten minutes nothing is suspected, and ALSA is not even read.
-        assert_eq!(watch.check(start, streaming), None);
-        assert_eq!(watch.check(start + shy(WEDGE_SILENCE), streaming), None);
-        assert_eq!(probes.get(), 0);
-
-        // Ten minutes of silence with sound playing: said, once.
-        assert_eq!(
-            watch.check(start + WEDGE_SILENCE, streaming),
-            Some(WEDGE_SILENCE)
-        );
-        assert_eq!(probes.get(), 1);
-        assert_eq!(
-            watch.check(start + WEDGE_SILENCE + Duration::from_secs(1), streaming),
-            None
-        );
-        assert_eq!(
-            watch.check(start + WEDGE_SILENCE + Duration::from_secs(3600), streaming),
-            None
-        );
-
-        // Said again a day later, with the silence it has grown to.
-        assert_eq!(
-            watch.check(start + WEDGE_SILENCE + shy(WEDGE_REMINDER), streaming),
-            None
-        );
-        assert_eq!(
-            watch.check(start + WEDGE_SILENCE + WEDGE_REMINDER, streaming),
-            Some(WEDGE_SILENCE + WEDGE_REMINDER)
-        );
-    }
-
-    #[test]
-    fn the_evidence_is_read_every_half_minute_at_most() {
-        let start = Instant::now();
-        let mut watch = WedgeWatch::new(start);
-        let probes = Cell::new(0);
-        let quiet = || {
-            probes.set(probes.get() + 1);
-            Some(false)
-        };
-
-        // Once suspected, the reader passes every second; ALSA is read on
-        // the first pass and then every PROBE_EVERY.
-        let suspect = start + WEDGE_SILENCE;
-        for second in 0..90 {
-            assert_eq!(
-                watch.check(suspect + Duration::from_secs(second), quiet),
-                None
-            );
+    /// Sends every liveness request that is due between `from` and `to`,
+    /// one pass a second as the reader does, and returns when each went out.
+    fn run(watch: &mut WedgeWatch, from: Instant, to: Instant) -> Vec<Instant> {
+        let mut sent = Vec::new();
+        let mut now = from;
+        while now <= to {
+            if watch.probe_due(now) {
+                watch.probed(now);
+                sent.push(now);
+            }
+            now += Duration::from_secs(1);
         }
-        assert_eq!(probes.get(), 3);
+        sent
     }
 
     #[test]
-    fn a_silent_dongle_without_sound_is_a_headset_that_is_off() {
+    fn a_dongle_that_answers_is_asked_every_five_minutes() {
         let start = Instant::now();
         let mut watch = WedgeWatch::new(start);
-        let suspect = start + WEDGE_SILENCE;
 
-        // No card: nothing to say, however long it lasts.
-        assert_eq!(watch.check(suspect, || None), None);
+        // At once on the first pass: a daemon started on a wedged dongle
+        // should say so within the half minute, not after five.
+        assert!(watch.probe_due(start));
+        watch.probed(start);
+        // Out, and not sent twice.
+        assert!(watch.unanswered_probe());
+        assert!(!watch.probe_due(start + Duration::from_secs(1)));
+
+        // Answered: nothing more until five minutes after the request.
+        let answered = start + Duration::from_secs(1);
+        assert!(!watch.heard(answered));
+        assert!(!watch.unanswered_probe());
+        assert!(!watch.probe_due(start + shy(PROBE_EVERY)));
+        assert!(watch.probe_due(start + PROBE_EVERY));
+        assert_eq!(watch.wedged(start + PROBE_EVERY), None);
+    }
+
+    #[test]
+    fn three_requests_lost_in_a_row_are_a_wedge() {
+        let start = Instant::now();
+        let mut watch = WedgeWatch::new(start);
+        let s = Duration::from_secs;
+
+        // Nothing ever answers: the request, then two retries ten seconds
+        // after each was sent, then back to the slow cadence.
+        let sent = run(&mut watch, start, start + s(400));
+        assert_eq!(sent, [start, start + s(10), start + s(20), start + s(320)]);
+
+        // Two lost requests are not a wedge; the third is, once it timed out.
+        let mut watch = WedgeWatch::new(start);
+        run(&mut watch, start, start + s(24));
+        assert_eq!(watch.wedged(start + s(24)), None);
+        run(&mut watch, start + s(25), start + s(25));
         assert_eq!(
-            watch.check(suspect + Duration::from_secs(7 * 86_400), || None),
-            None
+            watch.wedged(start + s(25)),
+            Some(Wedged {
+                silence: s(25),
+                reminder: false
+            })
         );
-        // Nor with a card that is idle.
+        // Said once.
+        assert_eq!(watch.wedged(start + s(26)), None);
+    }
+
+    #[test]
+    fn a_node_opened_on_a_wedged_dongle_is_asked_at_once() {
+        let start = Instant::now();
+        let mut watch = WedgeWatch::new(start);
+        let s = Duration::from_secs;
+
+        // Not wedged: a new node - the dongle re-enumerates at every link
+        // change - does not bring the next request forward.
+        run(&mut watch, start, start);
+        watch.heard(start + s(1));
+        watch.reopened();
+        assert!(!watch.is_wedged());
+        assert!(!watch.probe_due(start + s(2)));
+
+        // Wedged: the slow cadence, until a node is opened - the dongle was
+        // replugged, with luck - and then the request goes out at once.
+        let mut watch = WedgeWatch::new(start);
+        run(&mut watch, start, start + s(25));
+        assert!(watch.is_wedged());
+        assert!(!watch.probe_due(start + s(60)));
+        watch.reopened();
+        assert!(watch.probe_due(start + s(60)));
+        watch.probed(start + s(60));
+        // Answered: the wedge is over.
+        assert!(watch.wedged(start + s(60)).is_some());
+        assert!(watch.heard(start + s(61)));
+        assert!(!watch.is_wedged());
+    }
+
+    #[test]
+    fn one_lost_answer_is_not_a_wedge() {
+        // The dongle re-enumerated, or another program fetched the report
+        // first: the retry is answered, and the count starts over.
+        let start = Instant::now();
+        let mut watch = WedgeWatch::new(start);
+        let s = Duration::from_secs;
+
+        run(&mut watch, start, start + s(21));
+        watch.heard(start + s(21));
+        // Two were lost, the third answered: back to the slow cadence, and a
+        // later loss counts from one again.
+        assert_eq!(watch.wedged(start + s(30)), None);
+        let sent = run(
+            &mut watch,
+            start + s(22),
+            start + s(20) + PROBE_EVERY + s(12),
+        );
         assert_eq!(
-            watch.check(suspect + Duration::from_secs(8 * 86_400), || Some(false)),
-            None
+            sent,
+            [start + s(20) + PROBE_EVERY, start + s(30) + PROBE_EVERY]
         );
-        // And the dongle speaking was not a recovery, since nothing was said.
-        assert!(!watch.heard(suspect + Duration::from_secs(9 * 86_400)));
+        assert_eq!(watch.wedged(start + s(32) + PROBE_EVERY), None);
+    }
+
+    #[test]
+    fn the_wedge_is_said_again_once_a_day() {
+        let start = Instant::now();
+        let mut watch = WedgeWatch::new(start);
+        let s = Duration::from_secs;
+
+        run(&mut watch, start, start + s(25));
+        let warned = start + s(25);
+        assert!(watch.wedged(warned).is_some());
+
+        // The slow cadence goes on, unanswered, and nothing more is said...
+        run(&mut watch, warned, warned + shy(WEDGE_REMINDER));
+        assert_eq!(watch.wedged(warned + shy(WEDGE_REMINDER)), None);
+        // ...until a day has passed, with the silence it has grown to.
+        assert_eq!(
+            watch.wedged(warned + WEDGE_REMINDER),
+            Some(Wedged {
+                silence: s(25) + WEDGE_REMINDER,
+                reminder: true
+            })
+        );
     }
 
     #[test]
     fn the_dongle_speaking_again_is_a_recovery_and_restarts_the_clock() {
         let start = Instant::now();
         let mut watch = WedgeWatch::new(start);
-        let suspect = start + WEDGE_SILENCE;
-        assert_eq!(watch.check(suspect, || Some(true)), Some(WEDGE_SILENCE));
+        let s = Duration::from_secs;
 
-        // The dongle was replugged and announces the link: worth a line, one.
-        let replugged = suspect + Duration::from_secs(3 * 3600);
+        // A dongle that was never reported has nothing to recover from.
+        assert!(!watch.heard(start));
+
+        run(&mut watch, start, start + s(25));
+        assert!(watch.wedged(start + s(25)).is_some());
+
+        // The dongle was replugged and says something: worth a line, one.
+        let replugged = start + s(3 * 3600);
         assert!(watch.heard(replugged));
-        // Said once; and every message restarts the silence.
-        let last = replugged + Duration::from_secs(1);
+        let last = replugged + s(1);
         assert!(!watch.heard(last));
-        assert_eq!(
-            watch.silence(last + Duration::from_secs(5)),
-            Duration::from_secs(5)
-        );
+        assert_eq!(watch.silence(last + s(5)), s(5));
+        assert_eq!(watch.wedged(last + s(5)), None);
 
-        // Wedged again later: a fresh silence, a fresh warning after ten
-        // minutes - not a reminder a day away.
-        assert_eq!(watch.check(last + shy(WEDGE_SILENCE), || Some(true)), None);
+        // Wedged again later: a fresh warning, not a reminder a day away.
+        let again = run(&mut watch, last, last + PROBE_EVERY + s(30));
+        let third = *again.last().unwrap();
+        run(&mut watch, third + s(5), third + s(5));
         assert_eq!(
-            watch.check(last + WEDGE_SILENCE, || Some(true)),
-            Some(WEDGE_SILENCE)
+            watch.wedged(third + s(5)).map(|wedged| wedged.reminder),
+            Some(false)
         );
+    }
+
+    #[test]
+    fn the_trace_keeps_the_last_exchanges_with_their_age() {
+        let start = Instant::now();
+        let mut trace = Trace::default();
+        for second in 0..60 {
+            trace.record(
+                start + Duration::from_secs(second),
+                format!("event {second}"),
+            );
+        }
+
+        let lines: Vec<String> = trace.lines(start + Duration::from_secs(60)).collect();
+        assert_eq!(lines.len(), TRACE_CAPACITY);
+        // The oldest were dropped; what is left is in order, oldest first.
+        assert_eq!(lines[0], "    48.0s ago  event 12");
+        assert_eq!(lines[TRACE_CAPACITY - 1], "     1.0s ago  event 59");
+    }
+
+    #[test]
+    fn bytes_are_written_as_the_documentation_writes_them() {
+        assert_eq!(
+            hex(&[0x05, 0x5b, 0x03, 0x00, 0xd6, 0x0c, 0x02]),
+            "05 5b 03 00 d6 0c 02"
+        );
+        assert_eq!(hex(&[]), "");
     }
 
     #[test]

@@ -266,6 +266,7 @@ fn status(source: &mut Source) -> Result<()> {
             }
             BatteryState::Unavailable => "not supported by this headset".to_owned(),
             BatteryState::Disconnected => "headset switched off (the dongle says so)".to_owned(),
+            BatteryState::Fault => "unknown: the dongle needs attention".to_owned(),
         };
         let published = find_power_supply(&headset.uniq()).map_or_else(
             || "not published (is the daemon running?)".to_owned(),
@@ -276,16 +277,17 @@ fn status(source: &mut Source) -> Result<()> {
             "{} [{:04x}:{:04x}] via {}\n  battery: {battery}\n  sysfs:   {published}",
             headset.name, headset.vendor_id, headset.product_id, headset.product,
         )?;
-        // A dongle that answers nothing while streaming sound is wedged, not
-        // idle; the daemon's journal says since when (see the README's
-        // Troubleshooting).
+        // A dongle that does not even answer a request addressed to itself
+        // is wedged, not idle; the daemon's journal says since when (see the
+        // README's Troubleshooting).
         if headset.vendor_id == headset_battery_indicator::maxwell::VENDOR_ID
+            && headset.battery == BatteryState::Unavailable
             && source.looks_wedged()
         {
             writeln!(
                 out,
-                "  dongle:  not answering, audio running — probably wedged; unplug and replug \
-                 the dongle (the daemon's journal says since when)"
+                "  dongle:  not answering its own liveness request — probably wedged; unplug \
+                 and replug the dongle (the daemon's journal says since when)"
             )?;
         }
     }

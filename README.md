@@ -250,18 +250,19 @@ node to learn where things stand. Five minutes is plenty: the Maxwell's
 battery lasts some eighty hours, so it loses a percent every fifty minutes or
 so, and the dongle volunteers the level whenever the headset connects anyway.
 
-That restraint is not politeness. An earlier version asked every ten seconds
+That restraint began as a cure. An earlier version asked every ten seconds
 whether or not the headset was there. After an hour with the headset off -
 some 320 unanswered requests - the dongle's command channel was dead: audio
 still worked, but it answered no request at all, not even those addressed to
 the dongle itself, and only unplugging it brought it back. Requests for an
-absent headset most likely pile up in the dongle; whatever the cause, not
-sending them is the cure. As a second line of defence the reader stops asking
-when a headset that is announced as linked leaves three requests unanswered,
-and says so in the journal. Stops, not for good: a session that has heard
-nothing is asked again every ten minutes - six requests an hour, a hundredth
-of what wedged the dongle - so a headset that came back unannounced, or was
-wrongly given up on, is still found.
+absent headset piling up in the dongle was the explanation then; it has not
+held up (see below). The restraint stays all the same: a request nobody
+answers is of no use, and what does wedge the dongle is not known. As a
+second line of defence the reader stops asking when a headset that is
+announced as linked leaves three requests unanswered, and says so in the
+journal. Stops, not for good: a session that has heard nothing is asked again
+every ten minutes, so a headset that came back unannounced, or was wrongly
+given up on, is still found.
 
 The dongle also re-enumerates on USB a second or two after every link change,
 so its hidraw node vanishes and comes back. The daemon reopens it, carries what
@@ -269,23 +270,45 @@ it knew across, and does not fall back to HeadsetControl for that gap.
 
 ### When the dongle wedges anyway
 
-From the HID side a wedged dongle and a headset that is switched off look the
-same: nothing comes back. The tell is on the audio side. The dongle's USB
-audio interfaces - and the ALSA card they make - only exist while a headset
-is linked, and a playback stream in `RUNNING` state means sound is going to a
-headset that is there. So once the dongle has said nothing for ten minutes
-(long enough for the slow cadence above to have asked it at least once) the
-daemon finds the dongle's card through sysfs and reads
-`/proc/asound/cardN/pcm*p/sub0/status`, at most every thirty seconds; if
-sound is playing, it warns:
+It has happened twice, on 2026-09-22 and 2026-11-01: some time after the
+headset was switched off, the dongle stopped writing anything into its report
+- no link event, no battery answer - while its audio went on working. To a
+reader that listens, that is what a headset that is switched off looks like.
+
+The difference shows when the dongle itself is asked something. Every five
+minutes the daemon sends it the battery request addressed to the dongle
+rather than to the headset; that request never goes over the air, and a
+dongle that is alive answers it within some 50 ms, headset or no headset. A
+wedged one never does. One unanswered request is retried twice, ten seconds
+apart, and after three in a row the daemon warns:
 
 ```
-the Audeze dongle is streaming audio but has answered nothing for 3h: it is most likely wedged — unplug and replug the dongle (power-cycling the headset is not enough)
+the Audeze dongle no longer answers requests addressed to itself; it last said something 5min ago: it is wedged — unplug and replug the dongle (power-cycling the headset is not enough)
 ```
 
-Once, then once a day while it lasts, and `the dongle answers again` when it
-is over. It never sends the dongle anything more to find out - more requests
-are what wedges it. See [Troubleshooting](#troubleshooting) for what to do.
+followed, the first time, by the last exchanges it had with the dongle
+(sessions opened, requests sent, every report that carried something, each
+with its age). Then once a day while it lasts, and `the dongle answers again`
+when it is over. See [Troubleshooting](#troubleshooting) for what to do.
+
+A journal is not where this gets noticed - the second wedge sat there for two
+weeks - and a sandboxed system service has no way to a desktop session. So
+the alert goes where the battery was: while the wedge lasts the daemon
+publishes, in place of the headset, an **empty battery named `Audeze Maxwell
+dongle wedged - replug it`**. The applet shows it at 0 %, and the desktop
+raises its own low-battery notification for it. It is a separate UPower
+device (`hid-headset-3329-4b18-fault-battery`), so the 0 % stays out of the
+headset's charge history, and it goes away within seconds of the dongle
+being replugged: a node opened during a wedge is asked at once.
+
+What causes it is not known. It could not be provoked on a freshly plugged
+dongle: not by leaving answers unfetched until its 59-byte buffer wrapped,
+not by 375 requests to a headset that was off, not by twenty requests a
+second across six link changes. Nor could it be cleared from the host: the
+dongle keeps its state through its own re-enumerations, a reboot, and a port
+disabled for five seconds - only cutting its power restarts it. The exchanges
+the daemon now writes out with the warning are there to date the next one
+and show what preceded it; if you get one, they are worth an issue.
 
 ## Noisy readings
 
@@ -380,7 +403,7 @@ src/
 │   ├── frame.rs     the dongle's report: the request, the frame, the messages in it
 │   ├── session.rs   one open dongle: link state, when to ask, the request budget
 │   ├── discover.rs  the dongle in sysfs, and the wired headset next to it
-│   └── wedge.rs     a wedged dongle told from a headset that is off: the ALSA evidence, when to say so
+│   └── wedge.rs     a wedged dongle told from a headset that is off: the liveness request, the last exchanges
 └── bridge/          the daemon's loop
     ├── mod.rs       `Bridge`, `Config`, the `Uhid` seam and `DevicePool`
     ├── batteries.rs the virtual batteries and what is known about each
@@ -393,9 +416,9 @@ dongle live in `maxwell/frame.rs`, and the session tests borrow them.
 
 The CLI tests drive the binary against a stub `headsetcontrol`, so they run
 anywhere. The native reader is tested on frames captured from a real dongle,
-on `/dev/null` standing in for the node, and on fake sysfs and `/proc/asound`
-trees for the dongle filter and the wedge detector (whose clock is passed
-in, so ten minutes of silence and a day's reminder cost nothing). What talks to the real kernel is tested in the shared crates: reading
+on `/dev/null` standing in for the node, and on a fake sysfs tree for the
+dongle filter; the wedge detector's clock is passed in, so five minutes
+between liveness requests and a day's reminder cost nothing. What talks to the real kernel is tested in the shared crates: reading
 hidraw nodes in [hidraw](https://github.com/GregDuhamel/hidraw), creating a
 virtual battery and reading it back from sysfs in
 [uhid-battery](https://github.com/GregDuhamel/uhid-battery), as root.
@@ -491,30 +514,29 @@ headset-battery-indicator udev-rules | sudo tee /etc/udev/rules.d/70-headset-bat
 sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=hidraw
 ```
 
-**The headset works but UPower shows nothing.** Sound plays, yet the
-applet lists no headset, and the journal has been saying *"Audeze Maxwell is
-detected but not answering battery queries (switched off?)"* for a while.
-Look for this line (`journalctl -u headset-battery-indicator`):
+**The applet shows `Audeze Maxwell dongle wedged - replug it` at 0 %.** Or,
+before 0.7.0: sound plays, yet the applet lists no headset. The journal
+(`journalctl -u headset-battery-indicator`) has this line:
 
 ```
-the Audeze dongle is streaming audio but has answered nothing for 3h: it is most likely wedged — unplug and replug the dongle (power-cycling the headset is not enough)
+the Audeze dongle no longer answers requests addressed to itself; it last said something 5min ago: it is wedged — unplug and replug the dongle (power-cycling the headset is not enough)
 ```
 
 or run `headset-battery-indicator status`, which prints `dongle: not
-answering, audio running — probably wedged` under the headset's entry when
-its one request goes unanswered while sound is playing.
+answering its own liveness request — probably wedged` under the headset's
+entry when the request it sends the dongle goes unanswered.
 
-The dongle has wedged: its audio keeps working, but its status channel
-answers nothing - not a link event, not a battery answer, not a request
-addressed to the dongle itself - and its answer report is frozen, with an old
-battery answer still inside. (That frozen report is also why HeadsetControl
-keeps reporting a stale level from such a dongle: it scans the whole buffer,
-leftovers included.) The daemon cannot ask its way out of it: requests are
-what wedge the dongle in the first place, so it only watches and says so.
+The dongle has wedged: its audio keeps working, but it writes nothing into
+its report any more - not a link event, not a battery answer, not the answer
+to a request addressed to the dongle itself - and that report is frozen, with
+an old battery answer still inside. (That frozen report is also why
+HeadsetControl keeps reporting a stale level from such a dongle: it scans the
+whole buffer, leftovers included.) Nothing the host can do restarts it: it
+has to lose its power.
 
 The remedy is physical: **unplug the dongle and plug it back in.**
 Switching the headset off and on re-enumerates the dongle on USB but does not
-clear the wedge. The journal then says `the dongle answers again`, and the
+clear the wedge, and neither does a reboot. The journal then says `the dongle answers again`, and the
 entry is back within a few seconds.
 
 **`out of inherited /dev/uhid descriptors`.** You have more than one headset;
