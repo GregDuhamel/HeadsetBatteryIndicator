@@ -46,50 +46,94 @@
 //! is known to be linked, plus a handful of times per opened node - the first after
 //! listening for a few seconds - to learn where things stand.
 //!
-//! That restraint is not politeness. A daemon that kept sending a request every
+//! That restraint began as a cure. A daemon that kept sending a request every
 //! ten seconds to a headset that was switched off left the dongle's command
 //! channel dead after an hour or so: audio still worked, but it answered no
 //! request at all, not even those addressed to the dongle itself, and only a
-//! power cycle brought it back. The likeliest explanation is that requests for
-//! an absent headset pile up in the dongle; whatever the cause, not sending
-//! them is the cure. As a second line of defence the reader stops asking when
-//! a headset that is supposed to be linked stops answering. Stops, not for
-//! ever: a session that has heard nothing is asked again every ten minutes,
-//! which is a hundredth of the pace that wedged the dongle, so a headset that
-//! came back unannounced is still found.
+//! power cycle brought it back. Requests for an absent headset piling up in
+//! the dongle was the explanation at the time, and it has not held up: on
+//! 2026-11-16 a freshly plugged dongle took 375 such requests in twenty
+//! seconds, then 4600 more across six link changes, and stayed alive (see
+//! below). The restraint stays all the same - it costs nothing, a request
+//! nobody answers is of no use, and what does wedge the dongle is not known.
+//! As a second line of defence the reader stops asking when a headset that is
+//! supposed to be linked stops answering. Stops, not for ever: a session that
+//! has heard nothing is asked again every ten minutes, so a headset that came
+//! back unannounced is still found.
 //!
 //! The dongle also re-enumerates on USB a second or two after every link
 //! change, so its hidraw node vanishes and comes back; the reader reopens it.
 //!
 //! # A wedged dongle
 //!
-//! The restraint above was not enough once. On 2026-09-22 an Xbox dongle
-//! (`3329:4b18`) wedged in the way described, and stayed so for two weeks:
-//! the audio played, but its status channel answered nothing - not a link
-//! event, not a battery answer, not a request addressed to the dongle itself -
-//! and its answer report (`GET_REPORT` on report `0x07`) came back frozen,
-//! fresh-byte count at zero with an old battery answer still in it. From the
-//! HID side that is exactly what a headset that is switched off looks like,
+//! The dongle has wedged twice with this reader, on 2026-09-22 and on
+//! 2026-11-01, both times some time after the headset was switched off and
+//! before it was next switched on: the audio played, but its status channel
+//! said nothing - not a link event, not a battery answer - and its answer
+//! report (`GET_REPORT` on report `0x07`) came back frozen, fresh-byte count
+//! at zero with the last messages it ever wrote still in it. To a reader that
+//! listens, that is exactly what a headset that is switched off looks like,
 //! so the daemon said "detected but not answering battery queries (switched
-//! off?)" and nobody looked. Power-cycling the headset re-enumerated the
-//! dongle on USB and changed nothing; only unplugging the dongle did.
-//! (HeadsetControl, which scans the whole frozen report, kept reporting the
-//! stale level in it, which is how the wedge went unnoticed elsewhere.)
+//! off?)" and nobody looked, two weeks each time. (HeadsetControl, which
+//! scans the whole frozen report, kept reporting the stale level in it.)
 //!
-//! The tell is on the audio side. The dongle's USB audio interfaces, and the
-//! ALSA card they make, only exist while a headset is linked; and a playback
-//! PCM of that card in `RUNNING` state means sound is being streamed to a
-//! headset that is there. A dongle that streams and still says nothing for
-//! ten minutes - long enough for the slow cadence to have asked it at least
-//! once - is wedged, not idle. The `wedge` module finds the card through
-//! sysfs (from the hidraw node up to the USB device, then down its other
-//! interfaces to `sound/cardN`) and reads `/proc/asound/cardN/pcm*p/sub0/
-//! status`, at most every thirty seconds and only once the silence has
-//! lasted. The reader then warns once, and once a day after that, naming the
-//! remedy; and says so when the dongle speaks again. It never asks more for
-//! it: more requests are what wedges the dongle. The `status` command does
-//! the same check on its one-shot reading. All of this needs `/proc/asound`,
-//! which is why the shipped unit does not set `ProcSubset=pid`.
+//! What was established on the second one, on the wedged dongle and then on
+//! the same dongle replugged:
+//!
+//! - The USB side is alive. Output reports are taken - the third byte of the
+//!   answer report follows the address (`80` headset, `00` dongle) of the
+//!   last request - and `GET_REPORT` answers in 3 ms. It is whatever writes
+//!   messages into the report that is dead.
+//! - Nothing short of cutting its power revives it: not the dongle's own
+//!   re-enumerations, not a reboot (some fifteen of them, each a port reset),
+//!   not disabling the port from the host for five seconds. Its buffer keeps
+//!   its content through all of them, so the firmware never restarts.
+//! - A dongle that is alive answers a battery request addressed to *itself*
+//!   (`06 07 00 05 5a 03 00 d6 0c`) within 50 ms with `05 5b 03 00 d6 0c 02`,
+//!   headset or no headset. A wedged one never does. That is the liveness
+//!   request of the `wedge` module.
+//! - Requests relayed to a headset that is off are dropped without a trace:
+//!   no acknowledgement comes back, wedged or not. So the unanswered
+//!   questions of 2026-11-01 do not date the wedge.
+//! - It could not be provoked: not by 84 bytes of answers left unfetched (the
+//!   59-byte buffer wraps and overwrites itself - answers are lost, nothing
+//!   worse), not by 375 requests to an absent headset, not by twenty
+//!   requests a second across six link changes.
+//!
+//! The cause is therefore unknown, and may not be this reader at all: on
+//! 2026-10-29 the same dongle stopped answering control transfers for some
+//! twenty seconds after a link came up, dropped off the bus for five seconds
+//! instead of its usual two, and came back healthy - a firmware that crashed
+//! and restarted by the look of it. The protocol under the HID reports is
+//! Airoha's RACE (`05 5a` a command, `05 5b` its response, `05 5d` an
+//! indication, then a 16-bit length and a 16-bit command ID, `0cd6` being the
+//! battery).
+//!
+//! So the reader watches for it. Every five minutes it sends the liveness
+//! request; one that goes unanswered is retried twice, ten seconds apart, and
+//! three in a row make a wedge: the reader warns, once and then once a day,
+//! naming the remedy, and writes out the last exchanges it had with the
+//! dongle (the `wedge` module keeps the last forty-eight), since those are
+//! what the next occurrence has to tell. It says so when the dongle speaks
+//! again. The `status` command sends the same request on its one-shot
+//! reading.
+//!
+//! A journal is not where a wedge gets noticed, though, and the daemon is a
+//! sandboxed system service with no way to a desktop session. So while the
+//! wedge lasts the dongle is reported as a [`BatteryState::Fault`] under
+//! [`WEDGED_NAME`] instead of as the headset, which the bridge publishes as
+//! an empty battery: the applet that showed the headset's level shows that
+//! instead, and the desktop's own low-battery notification does the rest. A
+//! node opened while it lasts - the dongle was replugged, with luck - is sent
+//! the liveness request at once, so the alert goes with the wedge.
+//!
+//! # Replayed messages
+//!
+//! Right after it re-enumerates, the dongle can hand back as fresh what its
+//! buffer already held - a link event and a level from before, then the new
+//! ones. Seen under heavy traffic on 2026-11-16; it is the likely source of
+//! the "appeared, switched off, appeared" bursts in the journal. Not handled
+//! yet.
 //!
 //! # Charging
 //!
@@ -109,7 +153,7 @@ use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use log::{debug, info, warn};
+use log::{debug, info, trace, warn};
 
 use crate::headset::{BatteryState, Headset};
 
@@ -120,7 +164,7 @@ mod wedge;
 
 use discover::{Dongle, discover_in, headset_is_wired};
 use session::{LISTEN_FIRST, Link, Session, report_error, report_recovery};
-use wedge::{WedgeWatch, human};
+use wedge::{Trace, WedgeWatch, hex, human};
 
 /// Audeze's USB vendor ID.
 pub const VENDOR_ID: u16 = 0x3329;
@@ -131,14 +175,15 @@ pub const PRODUCT_IDS: [u16; 2] = [
     0x4b18, // Maxwell Xbox dongle
 ];
 
+/// The name a wedged dongle is published under, in place of the headset's: it
+/// is what the desktop shows next to the empty battery, so it says what to
+/// do.
+pub const WEDGED_NAME: &str = "Audeze Maxwell dongle wedged - replug it";
+
 /// Where the kernel lists USB devices. It is read for the wired headset (see
 /// [`headset_is_wired`]); the dongle's hidraw nodes come from
 /// [`hidraw::discover`].
 const USB_DEVICES: &str = "/sys/bus/usb/devices";
-
-/// Where ALSA reports the state of each card's PCMs, which the wedge detector
-/// reads (see [`wedge`]).
-const PROC_ASOUND: &str = "/proc/asound";
 
 /// How often, and how many times, a one-shot reading looks for its answer.
 const ANSWER_DELAY: Duration = Duration::from_millis(60);
@@ -163,11 +208,14 @@ pub struct Reader {
     /// dongle's re-enumerations: a counter restarting at zero made a reading
     /// from the new session look like the previous session's first one.
     readings: u64,
-    /// How long the dongle has said nothing, and whether that has been
-    /// reported; started on the first dongle opened. Kept here for the same
-    /// reason as `readings`: the silence is the dongle's, and outlives the
-    /// sessions its re-enumerations open.
+    /// The dongle's liveness: how long it has said nothing, the request that
+    /// checks it, and whether a wedge has been reported; started on the
+    /// first dongle opened. Kept here for the same reason as `readings`: the
+    /// silence is the dongle's, and outlives the sessions its
+    /// re-enumerations open.
     wedge: Option<WedgeWatch>,
+    /// The last exchanges with the dongle, written out when it wedges.
+    trace: Trace,
 }
 
 impl Reader {
@@ -250,16 +298,25 @@ impl Reader {
                             (BatteryState::Unavailable, 0)
                         }
                     };
+                // A wedged dongle knows nothing of the headset, and says so
+                // nowhere a desktop user looks: it is reported as a fault,
+                // under a name that carries the remedy, until it speaks again.
+                let wedged = self.wedge.as_ref().is_some_and(WedgeWatch::is_wedged);
+                let (name, battery, sample) = if wedged {
+                    (WEDGED_NAME, BatteryState::Fault, None)
+                } else {
+                    // The level is cached between the dongle's messages, and
+                    // this runs every second: say which message it came from.
+                    ("Audeze Maxwell", battery, Some(sample))
+                };
                 Headset {
-                    name: "Audeze Maxwell".to_owned(),
+                    name: name.to_owned(),
                     product: dongle.product.clone(),
                     vendor_id: VENDOR_ID,
                     product_id: dongle.product_id,
                     supports_battery: true,
                     battery,
-                    // The level is cached between the dongle's messages, and this
-                    // runs every second: say which message it came from.
-                    sample: Some(sample),
+                    sample,
                 }
             })
             .collect()
@@ -285,17 +342,17 @@ impl Reader {
     }
 
     /// Whether a dongle looks wedged right now, for the `status` command:
-    /// open, with no headset known to be linked and no level, yet streaming
-    /// sound - which only a linked headset receives. The daemon's own watch
-    /// waits for the silence to last and says since when; a one-shot reading
-    /// has only its own unanswered request to go by, so this is a likelihood.
+    /// the liveness request [`Reader::read_once`] sent it is still without
+    /// an answer, when a dongle that is alive gives one within some 50 ms.
+    /// The daemon's own watch asks three times before saying so, and says
+    /// since when; a one-shot reading has its one request to go by - which a
+    /// running daemon may have fetched the answer to - so this is a
+    /// likelihood.
     #[must_use]
     pub fn looks_wedged(&self) -> bool {
-        self.sessions.values().any(|session| {
-            session.link != Link::Up
-                && session.level.is_none()
-                && session.playback_running(Path::new(PROC_ASOUND)) == Some(true)
-        })
+        self.wedge
+            .as_ref()
+            .is_some_and(WedgeWatch::unanswered_probe)
     }
 
     fn listen_to(
@@ -314,34 +371,55 @@ impl Reader {
                 .unwrap_or(Link::Unknown);
             let session = Session::open(dongle, link)?;
             debug!("opened {} ({})", dongle.node.display(), dongle.product);
+            self.trace
+                .record(now, format!("opened {}", dongle.node.display()));
             self.sessions.insert(dongle.node.clone(), session);
+            if let Some(watch) = self.wedge.as_mut() {
+                watch.reopened();
+            }
         }
         let session = self
             .sessions
             .get_mut(&dongle.node)
             .expect("the session was just inserted");
 
-        let heard = session.listen(&mut self.readings)?;
+        let fresh = session.listen(&mut self.readings)?;
         let watch = self.wedge.get_or_insert_with(|| WedgeWatch::new(now));
-        if heard && watch.heard(now) {
-            info!("the dongle answers again");
+        if !fresh.is_empty() {
+            trace!("the dongle says: {}", hex(&fresh));
+            self.trace.record(now, format!("heard  {}", hex(&fresh)));
+            if watch.heard(now) {
+                info!("the dongle answers again");
+            }
         }
-        if session.should_ask(now, interval, listen_first) {
-            session.ask(now)?;
+        if session.should_ask(now, interval, listen_first) && session.ask(now)? {
+            self.trace
+                .record(now, "asked the headset for its level".to_owned());
         }
-        // A headset known to be linked is being asked and answering; it is
-        // the other two states that a wedge hides in. The watch decides when
-        // the silence has lasted and when to say so again (see `wedge`); what
-        // it does not do is ask the dongle anything more.
-        if session.link != Link::Up {
-            let proc_asound = Path::new(PROC_ASOUND);
-            if let Some(silence) = watch.check(now, || session.playback_running(proc_asound)) {
-                warn!(
-                    "the Audeze dongle is streaming audio but has answered nothing for {}: \
-                     it is most likely wedged — unplug and replug the dongle (power-cycling \
-                     the headset is not enough)",
-                    human(silence)
-                );
+        // The dongle itself is asked whether it is alive, on the watch's
+        // cadence (see `wedge`): every five minutes, whatever the headset is
+        // doing. That request is not relayed, so it is not part of the budget
+        // above; and it is what tells a wedge from a headset that is off.
+        if watch.probe_due(now) {
+            session.probe()?;
+            watch.probed(now);
+            self.trace
+                .record(now, "asked the dongle whether it is alive".to_owned());
+        }
+        if let Some(wedged) = watch.wedged(now) {
+            warn!(
+                "the Audeze dongle no longer answers requests addressed to itself; it last \
+                 said something {} ago: it is wedged — unplug and replug the dongle \
+                 (power-cycling the headset is not enough)",
+                human(wedged.silence)
+            );
+            // What led to it, the first time: nobody knows yet what wedges
+            // the dongle, and this is the only record of what preceded it.
+            if !wedged.reminder {
+                warn!("the last exchanges with the dongle, oldest first:");
+                for line in self.trace.lines(now) {
+                    warn!("  {line}");
+                }
             }
         }
         Ok((session.battery(wired), session.sample))
@@ -374,7 +452,6 @@ mod tests {
             node: PathBuf::from("/dev/null"),
             product: "Audeze Dongle".to_owned(),
             product_id: 0x4b18,
-            usb_device: None,
         };
         let now = Instant::now();
         let mut reader = Reader::new();
@@ -395,6 +472,27 @@ mod tests {
         assert_eq!((kept.link, kept.level, kept.asks), (Link::Up, Some(90), 3));
         // Nothing to go by on /dev/null: no USB device, no sound card.
         assert!(!reader.looks_wedged());
+
+        // Once the watch calls the dongle wedged, it is no longer the headset
+        // that is reported but the fault, under the name that says what to do.
+        let start = now;
+        let mut at = start;
+        let watch = reader.wedge.insert(WedgeWatch::new(start));
+        while !watch.is_wedged() {
+            if watch.probe_due(at) {
+                watch.probed(at);
+            }
+            at += Duration::from_secs(1);
+        }
+        let headsets = reader.reconcile(std::slice::from_ref(&dongle), false, at, minute, minute);
+        assert_eq!(headsets[0].name, WEDGED_NAME);
+        assert_eq!(headsets[0].battery, BatteryState::Fault);
+        assert_eq!(headsets[0].sample, None);
+        // And the headset again as soon as the dongle says anything.
+        reader.wedge.as_mut().unwrap().heard(at);
+        let headsets = reader.reconcile(std::slice::from_ref(&dongle), false, at, minute, minute);
+        assert_eq!(headsets[0].name, "Audeze Maxwell");
+        assert_eq!(headsets[0].battery, BatteryState::Unavailable);
 
         // A node that sysfs no longer lists takes its session with it, and
         // what it knew of the link is handed to the next one.
@@ -420,7 +518,6 @@ mod tests {
             node: PathBuf::from(node),
             product: "Audeze Dongle".to_owned(),
             product_id: 0x4b18,
-            usb_device: None,
         };
         let now = Instant::now();
         let minute = Duration::from_secs(60);

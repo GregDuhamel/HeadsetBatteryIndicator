@@ -19,6 +19,15 @@ const REPLY_REPORT_ID: u8 = 0x07;
 /// headset (the `0x80` in third position; `0x00` addresses the dongle itself).
 pub(super) const BATTERY_REQUEST: [u8; 9] = [0x06, 0x07, 0x80, 0x05, 0x5a, 0x03, 0x00, 0xd6, 0x0c];
 
+/// The same question addressed to the dongle itself (`0x00` in third
+/// position), which is how its liveness is checked: the request never goes
+/// over the air, and a dongle that is alive answers it within some 50 ms
+/// whether a headset is linked or not - with `05 5b 03 00 d6 0c 02`, a reply
+/// whose status says it has no battery to report. A wedged dongle takes the
+/// request (the third byte of its report follows the address of the last one
+/// it was sent) and answers nothing. See [`wedge`](super::wedge).
+pub(super) const LIVENESS_REQUEST: [u8; 9] = [0x06, 0x07, 0x00, 0x05, 0x5a, 0x03, 0x00, 0xd6, 0x0c];
+
 /// Offset of the count of fresh bytes in an input report.
 const FRESH_LEN_OFFSET: usize = 1;
 
@@ -42,8 +51,9 @@ pub(super) enum Message {
     Battery(u8),
 }
 
-/// The part of an input report written since it was last fetched.
-fn fresh(frame: &[u8]) -> &[u8] {
+/// The part of an input report written since it was last fetched. Empty for
+/// as long as the dongle has nothing to say - and for ever once it is wedged.
+pub(super) fn fresh(frame: &[u8]) -> &[u8] {
     let len = frame.get(FRESH_LEN_OFFSET).copied().map_or(0, usize::from);
     let end = (PAYLOAD_OFFSET + len).min(frame.len());
     frame.get(PAYLOAD_OFFSET..end).unwrap_or_default()

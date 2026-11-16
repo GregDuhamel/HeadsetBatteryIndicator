@@ -143,7 +143,8 @@ impl Source {
     }
 
     /// Whether the dongle the last [`Source::probe_once`] opened looks wedged:
-    /// silent, yet streaming sound (see [`maxwell::Reader::looks_wedged`]).
+    /// it left its liveness request unanswered (see
+    /// [`maxwell::Reader::looks_wedged`]).
     /// Never through HeadsetControl, which has no such tell.
     #[must_use]
     pub fn looks_wedged(&self) -> bool {

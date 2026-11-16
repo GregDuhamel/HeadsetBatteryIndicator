@@ -5,7 +5,7 @@
 //! documentation](super) says why it has to be a budget.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -13,8 +13,7 @@ use hidraw::Device;
 use log::{debug, info, trace, warn};
 
 use super::discover::Dongle;
-use super::frame::{BATTERY_REQUEST, MSG_SIZE, Message, fetch, messages};
-use super::wedge::playback_running;
+use super::frame::{BATTERY_REQUEST, LIVENESS_REQUEST, MSG_SIZE, Message, fetch, fresh, messages};
 use crate::headset::BatteryState;
 
 /// Requests a linked headset may leave unanswered before the reader stops
@@ -146,9 +145,6 @@ pub(super) enum Link {
 pub(super) struct Session {
     device: Device,
     pub(super) product_id: u16,
-    /// The dongle's USB device directory in sysfs, where its sound card is
-    /// looked for; see [`Dongle::usb_device`].
-    usb_device: Option<PathBuf>,
     pub(super) link: Link,
     pub(super) level: Option<u8>,
     /// Which of the reader's battery messages `level` came from (see
@@ -174,7 +170,6 @@ impl Session {
         Ok(Self {
             device,
             product_id: dongle.product_id,
-            usb_device: dongle.usb_device.clone(),
             link,
             level: None,
             sample: 0,
@@ -186,20 +181,20 @@ impl Session {
         })
     }
 
-    /// Fetches the report and takes in whatever it says, and tells whether
-    /// it said anything at all - the wedge detector counts the silence.
-    /// `readings` is the reader's count of battery messages, which every
-    /// level is numbered by.
-    pub(super) fn listen(&mut self, readings: &mut u64) -> io::Result<bool> {
+    /// Fetches the report, takes in whatever it says, and returns what the
+    /// dongle wrote since the last fetch - empty when it said nothing, which
+    /// is what the wedge detector counts: any byte at all proves the dongle
+    /// alive, understood or not. `readings` is the reader's count of battery
+    /// messages, which every level is numbered by.
+    pub(super) fn listen(&mut self, readings: &mut u64) -> io::Result<Vec<u8>> {
         let frame = fetch(&self.device)?;
-        Ok(self.take_in(&frame, readings))
+        self.take_in(&frame, readings);
+        Ok(fresh(&frame).to_vec())
     }
 
-    /// Takes in what a report says, and tells whether it said anything.
-    fn take_in(&mut self, frame: &[u8], readings: &mut u64) -> bool {
-        let messages = messages(frame);
-        let heard = !messages.is_empty();
-        for message in messages {
+    /// Takes in what a report says.
+    fn take_in(&mut self, frame: &[u8], readings: &mut u64) {
+        for message in messages(frame) {
             match message {
                 Message::Link(true) => {
                     if self.link != Link::Up {
@@ -228,14 +223,24 @@ impl Session {
                 }
             }
         }
-        heard
     }
 
-    /// Whether the dongle is streaming sound to the headset
-    /// ([`playback_running`]), which a dongle that answers nothing has no
-    /// business doing; `None` when it cannot be told.
-    pub(super) fn playback_running(&self, proc_asound: &Path) -> Option<bool> {
-        playback_running(proc_asound, self.usb_device.as_deref()?)
+    /// Asks the dongle itself whether it is alive ([`LIVENESS_REQUEST`]).
+    /// Nothing is kept of it here: whether it was answered is the
+    /// [`WedgeWatch`](super::wedge::WedgeWatch)'s to tell, from whatever the
+    /// next fetches bring. It is not one of the questions `should_ask`
+    /// budgets either, as the headset never hears of it.
+    pub(super) fn probe(&self) -> io::Result<()> {
+        self.send(&LIVENESS_REQUEST)
+    }
+
+    /// Sends one output report, report ID first (`request[0]`), padded to the
+    /// dongle's fixed report size.
+    fn send(&self, request: &[u8]) -> io::Result<()> {
+        let mut report = [0u8; MSG_SIZE];
+        report[..request.len()].copy_from_slice(request);
+        self.device.write(&report)?;
+        Ok(())
     }
 
     /// Whether a battery request is due: regularly while the headset is linked,
@@ -275,7 +280,9 @@ impl Session {
         }
     }
 
-    pub(super) fn ask(&mut self, now: Instant) -> io::Result<()> {
+    /// Sends the battery request, and tells whether it did: `false` when it
+    /// gave up on a headset that is announced but mute instead.
+    pub(super) fn ask(&mut self, now: Instant) -> io::Result<bool> {
         if self.pending {
             // Asking again with the previous request still open: it was lost.
             self.unanswered += 1;
@@ -294,18 +301,14 @@ impl Session {
             self.pending = false;
             self.unanswered = 0;
             self.asked_at = Some(now);
-            return Ok(());
+            return Ok(false);
         }
 
-        // One output report, report ID first (`BATTERY_REQUEST[0]`), padded to
-        // the dongle's fixed report size.
-        let mut request = [0u8; MSG_SIZE];
-        request[..BATTERY_REQUEST.len()].copy_from_slice(&BATTERY_REQUEST);
-        self.device.write(&request)?;
+        self.send(&BATTERY_REQUEST)?;
         self.asked_at = Some(now);
         self.asks += 1;
         self.pending = true;
-        Ok(())
+        Ok(true)
     }
 
     pub(super) fn battery(&self, wired: bool) -> BatteryState {
@@ -341,7 +344,6 @@ pub(super) mod tests {
         Session {
             device: Device::from_fd(null, "/dev/null"),
             product_id: 0x4b18,
-            usb_device: None,
             link,
             level,
             sample: u64::from(level.is_some()),

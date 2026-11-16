@@ -58,6 +58,10 @@ const SUMMARY_SETTLE: Duration = Duration::from_secs(5);
 /// An unchanged level is pushed again this often, as a safety net for a push
 /// the kernel dropped while it was probing the device.
 const REPUBLISH_EVERY: Duration = Duration::from_secs(60);
+/// The level a [`BatteryState::Fault`] is published at. Empty: desktops show
+/// it in red and raise their low-battery notification, which is the point.
+const FAULT_PERCENT: u8 = 0;
+
 /// Default for [`Config::offline_grace`], in seconds.
 pub const DEFAULT_OFFLINE_GRACE_SECS: u64 = 10;
 /// Default for [`Config::missing_grace`], in seconds.
@@ -538,6 +542,11 @@ impl<S: BatterySource, U: Uhid> Bridge<S, U> {
                 trace!("{} is offline", headset.name);
                 return Ok(());
             }
+            // No level, but something the user has to see: an empty battery
+            // under the name the reader chose, which says what to do. It is
+            // an entry of its own (see `Headset::uniq`), withdrawn like any
+            // other once the reader stops listing it.
+            BatteryState::Fault => Reading::new(FAULT_PERCENT, false),
             // The reader was told the headset is gone: no grace to sit out.
             BatteryState::Disconnected => {
                 if let Some(index) = existing {
@@ -560,6 +569,7 @@ impl<S: BatterySource, U: Uhid> Bridge<S, U> {
             if retry_pending || self.abandoned.contains(&key) {
                 return Ok(());
             }
+            self.supersede(headset);
             return match self.attach(headset, reading, now) {
                 Ok(()) => {
                     self.attach_retry_at.remove(&key);
@@ -655,6 +665,33 @@ impl<S: BatterySource, U: Uhid> Bridge<S, U> {
         self.attach_retry_at.insert(battery.key, now + ATTACH_RETRY);
         self.uhid.release(device);
         false
+    }
+
+    /// Withdraws the entry the same device had under another name, before
+    /// `headset` gets its own.
+    ///
+    /// A reader renames what it reports when the thing changes nature - a
+    /// wedged dongle in place of the headset behind it, and back (see
+    /// [`BatteryState::Fault`]). Left to the missing grace, the old entry
+    /// would sit next to the new one for half a minute, and hold the one
+    /// uhid descriptor the unit passes while the new one asks for it.
+    fn supersede(&mut self, headset: &Headset) {
+        let device = format!("{:04x}:{:04x}/", headset.vendor_id, headset.product_id);
+        loop {
+            let found = self
+                .batteries
+                .iter()
+                .position(|battery| battery.key.starts_with(&device));
+            let Some(index) = found else {
+                break;
+            };
+            let (device, battery) = self.batteries.remove(index);
+            info!(
+                "{} is now reported as {}, removing its battery",
+                battery.name, headset.name
+            );
+            self.uhid.release(device);
+        }
     }
 
     /// Registers a new virtual battery with the kernel.

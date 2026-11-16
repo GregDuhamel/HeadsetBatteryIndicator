@@ -12,6 +12,12 @@ pub enum BatteryState {
     /// Positively known to be switched off or out of range, as opposed to merely
     /// not answering: the reader was told so. There is nothing to wait for.
     Disconnected,
+    /// The reader's own hardware has failed and needs a hand - a wedged
+    /// dongle, which only replugging revives. No level is known. The reader
+    /// reports it under a name that says what to do, and the bridge publishes
+    /// it as an empty battery: on a desktop that only shows batteries, that
+    /// is the one place where it gets seen.
+    Fault,
 }
 
 /// One headset, as reported by whichever reader found it.
@@ -75,9 +81,21 @@ impl Headset {
     ///
     /// The kernel builds the sysfs power supply name out of it
     /// (`hid-<uniq>-battery`), so it must not contain anything exotic.
+    ///
+    /// A [`BatteryState::Fault`] gets one of its own: UPower keeps a charge
+    /// history per identifier, and the empty battery that stands for a fault
+    /// has no business in the headset's.
     #[must_use]
     pub fn uniq(&self) -> String {
-        format!("headset-{:04x}-{:04x}", self.vendor_id, self.product_id)
+        let fault = if self.battery == BatteryState::Fault {
+            "-fault"
+        } else {
+            ""
+        };
+        format!(
+            "headset-{:04x}-{:04x}{fault}",
+            self.vendor_id, self.product_id
+        )
     }
 }
 
@@ -108,6 +126,14 @@ mod tests {
         let name = named(&"é".repeat(100)).display_name();
         assert_eq!(name.len(), 126);
         assert!(name.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn a_fault_is_published_apart_from_the_headset() {
+        let mut headset = named("Audeze Maxwell");
+        assert_eq!(headset.uniq(), "headset-3329-4b18");
+        headset.battery = BatteryState::Fault;
+        assert_eq!(headset.uniq(), "headset-3329-4b18-fault");
     }
 
     #[test]
